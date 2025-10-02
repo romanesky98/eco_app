@@ -1,5 +1,5 @@
 """
-Streamlit ECB (SDW) Explorer
+Streamlit ECB (SDW) Explorer — resilient
 
 Quick start:
 1) Save this file as app_ecb.py
@@ -9,25 +9,25 @@ Quick start:
    streamlit run app_ecb.py
 
 Data source: European Central Bank Statistical Data Warehouse (SDW)
-API docs: https://sdw-wsrest.ecb.europa.eu 
+API docs: https://sdw-wsrest.ecb.europa.eu
 No API key required.
 
 Notes:
-- Use the search to find a dataset ("dataflow").
-- Paste one or more **series keys** for that dataset to fetch/plot data.
+- Search data **flows** (datasets), then paste one or more **series keys** for that flow to fetch/plot.
   Example for EXR (exchange rates): EXR.D.USD.EUR.SP00.A
 """
 
 import io
-import os
 from datetime import date
-from typing import List, Dict
+from typing import List
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 from dateutil.relativedelta import relativedelta
 import requests
+import time
+from requests.exceptions import HTTPError, RequestException
 
 APP_TITLE = "ECB SDW Data Explorer"
 DEFAULT_START = date.today() - relativedelta(years=10)
@@ -35,56 +35,77 @@ DEFAULT_END = date.today()
 ECB_BASE = "https://sdw-wsrest.ecb.europa.eu/service"
 
 # -------------------- Helpers -------------------- #
-@st.cache_data(show_spinner=False)
-def ecb_search_dataflows(query: str, limit: int = 50) -> pd.DataFrame:
-    """Search dataflows (datasets) by name/description (case-insensitive contains)."""
-    if not query.strip():
-        return pd.DataFrame()
+@st.cache_data(show_spinner=False, ttl=3600)
+def ecb_fetch_dataflows() -> pd.DataFrame:
+    """Fetch all dataflows once (cached for 1 hour)."""
     url = f"{ECB_BASE}/dataflow"
-    # sdmx-json is easier to parse
-    resp = requests.get(url, params={"format": "sdmx-json"}, timeout=30)
+    params = {"format": "sdmx-json"}
+    resp = requests.get(url, params=params, timeout=30)
     resp.raise_for_status()
     j = resp.json()
     flows = j.get("dataflows", {}).get("dataflow", [])
     rows = []
-    q = query.lower()
     for f in flows:
         flow_id = f.get("id")
         names = f.get("name", [])
         name_en = next((n["#text"] for n in names if n.get("@xml:lang", "en").startswith("en") and "#text" in n), None)
         name_any = name_en or (names[0]["#text"] if names else "")
-        if name_any and q in name_any.lower() or (flow_id and q in flow_id.lower()):
-            rows.append({"flow_id": flow_id, "name": name_any})
-        if len(rows) >= limit:
-            break
+        rows.append({"flow_id": flow_id, "name": name_any})
     return pd.DataFrame(rows)
 
 @st.cache_data(show_spinner=False)
+def ecb_search_dataflows_resilient(query: str, limit: int = 50) -> pd.DataFrame:
+    """Resilient dataflow search with exponential backoff retries."""
+    if not query.strip():
+        return pd.DataFrame()
+
+    last_err = None
+    for i in range(5):
+        try:
+            all_flows = ecb_fetch_dataflows()
+            q = query.lower()
+            matches = all_flows[
+                all_flows.apply(
+                    lambda r: q in str(r["name"]).lower() or q in str(r["flow_id"]).lower(),
+                    axis=1,
+                )
+            ]
+            return matches.head(limit).reset_index(drop=True)
+        except (HTTPError, RequestException, ValueError) as e:
+            last_err = e
+            time.sleep(0.8 * (2 ** i))
+    raise RuntimeError(f"ECB dataflow search failed after retries: {last_err}")
+
+@st.cache_data(show_spinner=False)
 def ecb_fetch_series_csv(flow_id: str, series_key: str, start: date, end: date) -> pd.DataFrame:
-    """Fetch a single ECB series using the CSV data endpoint and return a tidy DataFrame with Date and Value.
-    The CSV includes dimension columns; we keep them for labeling when useful.
-    """
-    start_s = start.isoformat()
-    end_s = end.isoformat()
+    """Fetch a single ECB series using the CSV data endpoint and return a tidy DataFrame with Date and Value."""
     params = {
         "detail": "dataonly",
-        "startPeriod": start_s,
-        "endPeriod": end_s,
+        "startPeriod": start.isoformat(),
+        "endPeriod": end.isoformat(),
         "format": "csvdata",
     }
     url = f"{ECB_BASE}/data/{flow_id}/{series_key}"
     r = requests.get(url, params=params, timeout=60)
     r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.text))
-    # Expect TIME_PERIOD, OBS_VALUE at minimum
     if "TIME_PERIOD" not in df.columns or "OBS_VALUE" not in df.columns:
         raise RuntimeError("Unexpected CSV format from ECB SDW.")
     df["Date"] = pd.to_datetime(df["TIME_PERIOD"], errors="coerce")
     df = df.sort_values("Date")
     df = df.rename(columns={"OBS_VALUE": "Value"})
-    # Build a friendly series name from available columns
+    # Build a friendly label
     label_parts = []
-    for c in ["TITLE", "TITLE_COMPL", "CURRENCY", "CURRENCY_DENOM", "EXR_TYPE", "EXR_SUFFIX", "UNIT", "UNIT_MULT"]:
+    for c in [
+        "TITLE",
+        "TITLE_COMPL",
+        "CURRENCY",
+        "CURRENCY_DENOM",
+        "EXR_TYPE",
+        "EXR_SUFFIX",
+        "UNIT",
+        "UNIT_MULT",
+    ]:
         if c in df.columns and pd.notna(df[c]).any():
             val = str(df[c].dropna().iloc[0])
             if val and val != "nan":
@@ -92,7 +113,6 @@ def ecb_fetch_series_csv(flow_id: str, series_key: str, start: date, end: date) 
     label = f"{flow_id}:{series_key}"
     if label_parts:
         label += " — " + ", ".join(label_parts)
-    # Reduce to Date/Value and attach column name
     out = df[["Date", "Value"]].copy()
     out = out.set_index("Date").rename(columns={"Value": label})
     return out
@@ -122,9 +142,9 @@ with st.sidebar:
     end_date = st.date_input("End", value=DEFAULT_END)
     st.markdown("---")
     st.markdown("### Help")
-    st.caption("Search a dataset, pick its ID (flow), then paste full series keys for that dataset. Example: EXR.D.USD.EUR.SP00.A")
+    st.caption("Search a dataset (flow), pick its ID, then paste full series keys. Example: EXR.D.USD.EUR.SP00.A")
 
-# Shared containers
+# Shared state
 results_df: pd.DataFrame = pd.DataFrame()
 chosen_flow = st.text_input("Selected dataset (flow ID)", placeholder="e.g., EXR, ICP, BSI, MNA")
 
@@ -139,7 +159,7 @@ with explore_tab:
         do_search = st.button("Search", type="primary", use_container_width=True)
         if do_search:
             try:
-                results_df = ecb_search_dataflows(query, limit)
+                results_df = ecb_search_dataflows_resilient(query, limit)
                 if results_df.empty:
                     st.warning("No matching datasets.")
             except Exception as e:
