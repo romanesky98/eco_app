@@ -1,0 +1,6 @@
+streamlit
+fredapi
+plotly
+pandas
+python-dateutil
+requests
