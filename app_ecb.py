@@ -38,27 +38,51 @@ ECB_BASE = "https://data-api.ecb.europa.eu/service"
 # -------------------- Helpers -------------------- #
 @st.cache_data(show_spinner=False, ttl=3600)
 def ecb_fetch_dataflows() -> pd.DataFrame:
-    """Fetch all dataflows once (cached for 1 hour) using JSON via Accept header.
+    """Fetch all dataflows once (cached for 1 hour).
+    Tries multiple Accept/format combinations to satisfy the ECB Data Portal and avoid 406/unsupported content.
     Returns a DataFrame with columns [flow_id, name].
     """
     url = f"{ECB_BASE}/dataflow"
-    headers = {"Accept": "application/vnd.sdmx.structure+json;version=1.0"}
-    resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
-    # Ensure JSON returned
-    ctype = resp.headers.get("Content-Type", "")
-    if "json" not in ctype.lower():
-        raise RuntimeError(f"Unexpected content type for dataflow: {ctype}")
-    j = resp.json()
-    flows = j.get("dataflows", {}).get("dataflow", [])
-    rows = []
-    for f in flows:
-        flow_id = f.get("id")
-        names = f.get("name", [])
-        name_en = next((n.get("#text") for n in names if str(n.get("@xml:lang", "en")).startswith("en") and "#text" in n), None)
-        name_any = name_en or (names[0].get("#text") if names else "")
-        rows.append({"flow_id": flow_id, "name": name_any})
-    return pd.DataFrame(rows)
+
+    header_options = [
+        {"Accept": "application/vnd.sdmx.structure+json;version=1.0"},
+        {"Accept": "application/vnd.sdmx.dataflow+json;version=1.0"},
+        {"Accept": "application/vnd.sdmx+json;version=1.0"},
+        {"Accept": "application/json"},
+        {},
+        {"Accept": "*/*"},
+    ]
+    param_options = [
+        {},
+        {"format": "sdmx-json"},
+        {"format": "jsondata"},
+    ]
+
+    last_err = None
+    for headers in header_options:
+        for params in param_options:
+            try:
+                resp = requests.get(url, headers=headers, params=params, timeout=30)
+                resp.raise_for_status()
+                ctype = resp.headers.get("Content-Type", "")
+                # Some gateways reply XML by default; skip if not JSON
+                if "json" not in ctype.lower():
+                    continue
+                j = resp.json()
+                flows = j.get("dataflows", {}).get("dataflow", [])
+                rows = []
+                for f in flows:
+                    flow_id = f.get("id")
+                    names = f.get("name", [])
+                    name_en = next((n.get("#text") for n in names if str(n.get("@xml:lang", "en")).startswith("en") and "#text" in n), None)
+                    name_any = name_en or (names[0].get("#text") if names else "")
+                    rows.append({"flow_id": flow_id, "name": name_any})
+                if rows:
+                    return pd.DataFrame(rows)
+            except Exception as e:
+                last_err = e
+                continue
+    raise RuntimeError(f"Unable to fetch dataflows from ECB endpoint with any Accept/format combination: {last_err}")
 
 @st.cache_data(show_spinner=False)
 def ecb_search_dataflows_resilient(query: str, limit: int = 50) -> pd.DataFrame:
