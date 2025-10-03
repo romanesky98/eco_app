@@ -1,5 +1,5 @@
 """
-Streamlit ECB (SDW) Explorer — resilient
+Streamlit ECB Data Portal Explorer (uses data-api.ecb.europa.eu)
 
 Quick start:
 1) Save this file as app_ecb.py
@@ -8,12 +8,13 @@ Quick start:
 3) Run the app:
    streamlit run app_ecb.py
 
-Data source: European Central Bank Statistical Data Warehouse (SDW)
-API docs: https://sdw-wsrest.ecb.europa.eu
+Data source: European Central Bank Data Portal (SDMX 2.1 REST)
+API docs: https://data.ecb.europa.eu/help/api/overview
+Base: https://data-api.ecb.europa.eu/service
 No API key required.
 
 Notes:
-- Search data **flows** (datasets), then paste one or more **series keys** for that flow to fetch/plot.
+- Search dataflows (datasets), then paste one or more full series keys for that flow.
   Example for EXR (exchange rates): EXR.D.USD.EUR.SP00.A
 """
 
@@ -29,10 +30,10 @@ import requests
 import time
 from requests.exceptions import HTTPError, RequestException
 
-APP_TITLE = "ECB SDW Data Explorer"
+APP_TITLE = "ECB Data Portal Explorer"
 DEFAULT_START = date.today() - relativedelta(years=10)
 DEFAULT_END = date.today()
-ECB_BASE = "https://sdw-wsrest.ecb.europa.eu/service"
+ECB_BASE = "https://data-api.ecb.europa.eu/service"
 
 # -------------------- Helpers -------------------- #
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -90,7 +91,7 @@ def ecb_fetch_series_csv(flow_id: str, series_key: str, start: date, end: date) 
     r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.text))
     if "TIME_PERIOD" not in df.columns or "OBS_VALUE" not in df.columns:
-        raise RuntimeError("Unexpected CSV format from ECB SDW.")
+        raise RuntimeError("Unexpected CSV format from ECB Data Portal.")
     df["Date"] = pd.to_datetime(df["TIME_PERIOD"], errors="coerce")
     df = df.sort_values("Date")
     df = df.rename(columns={"OBS_VALUE": "Value"})
@@ -173,7 +174,7 @@ with explore_tab:
             chosen_flow = st.selectbox("Dataset (flow)", options=flows, index=0)
         series_text = st.text_input("Series keys (comma-separated)", placeholder="EXR.D.USD.EUR.SP00.A, EXR.D.GBP.EUR.SP00.A")
         series_keys = [s.strip() for s in series_text.split(",") if s.strip()]
-        st.caption("Tip: Keys are dot-separated dimension codes specific to each dataset. Check ECB SDW for structure.")
+        st.caption("Tip: Keys are dot-separated dimension codes specific to each dataset. Check ECB Data Portal for structure.")
 
     st.markdown("---")
 
@@ -253,7 +254,7 @@ with analyze_tab:
 st.markdown(
     """
     <div style='text-align:center; opacity:0.7; font-size:0.9em;'>
-    Built with <a href='https://streamlit.io' target='_blank'>Streamlit</a> · Powered by <a href='https://sdw.ecb.europa.eu' target='_blank'>ECB SDW</a>
+    Built with <a href='https://streamlit.io' target='_blank'>Streamlit</a> · Powered by <a href='https://data.ecb.europa.eu' target='_blank'>ECB Data Portal</a>
     </div>
     """,
     unsafe_allow_html=True,
