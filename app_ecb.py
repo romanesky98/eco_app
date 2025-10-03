@@ -38,19 +38,25 @@ ECB_BASE = "https://data-api.ecb.europa.eu/service"
 # -------------------- Helpers -------------------- #
 @st.cache_data(show_spinner=False, ttl=3600)
 def ecb_fetch_dataflows() -> pd.DataFrame:
-    """Fetch all dataflows once (cached for 1 hour)."""
+    """Fetch all dataflows once (cached for 1 hour) using JSON via Accept header.
+    Returns a DataFrame with columns [flow_id, name].
+    """
     url = f"{ECB_BASE}/dataflow"
-    params = {"format": "sdmx-json"}
-    resp = requests.get(url, params=params, timeout=30)
+    headers = {"Accept": "application/vnd.sdmx.structure+json;version=1.0"}
+    resp = requests.get(url, headers=headers, timeout=30)
     resp.raise_for_status()
+    # Ensure JSON returned
+    ctype = resp.headers.get("Content-Type", "")
+    if "json" not in ctype.lower():
+        raise RuntimeError(f"Unexpected content type for dataflow: {ctype}")
     j = resp.json()
     flows = j.get("dataflows", {}).get("dataflow", [])
     rows = []
     for f in flows:
         flow_id = f.get("id")
         names = f.get("name", [])
-        name_en = next((n["#text"] for n in names if n.get("@xml:lang", "en").startswith("en") and "#text" in n), None)
-        name_any = name_en or (names[0]["#text"] if names else "")
+        name_en = next((n.get("#text") for n in names if str(n.get("@xml:lang", "en")).startswith("en") and "#text" in n), None)
+        name_any = name_en or (names[0].get("#text") if names else "")
         rows.append({"flow_id": flow_id, "name": name_any})
     return pd.DataFrame(rows)
 
@@ -87,7 +93,8 @@ def ecb_fetch_series_csv(flow_id: str, series_key: str, start: date, end: date) 
         "format": "csvdata",
     }
     url = f"{ECB_BASE}/data/{flow_id}/{series_key}"
-    r = requests.get(url, params=params, timeout=60)
+    headers = {"Accept": "text/csv"}
+    r = requests.get(url, params=params, headers=headers, timeout=60)
     r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.text))
     if "TIME_PERIOD" not in df.columns or "OBS_VALUE" not in df.columns:
