@@ -29,6 +29,7 @@ from dateutil.relativedelta import relativedelta
 import requests
 import time
 from requests.exceptions import HTTPError, RequestException
+import xml.etree.ElementTree as ET
 
 APP_TITLE = "ECB Data Portal Explorer"
 DEFAULT_START = date.today() - relativedelta(years=10)
@@ -93,7 +94,19 @@ def ecb_search_dataflows_resilient(query: str, limit: int = 50) -> pd.DataFrame:
     last_err = None
     for i in range(5):
         try:
-            all_flows = ecb_fetch_dataflows()
+            all_flows = ecb_fetch_dataflows_xml()
+            q = query.lower()
+            matches = all_flows[
+                all_flows.apply(
+                    lambda r: q in str(r["name"]).lower() or q in str(r["flow_id"]).lower(),
+                    axis=1,
+                )
+            ]
+            return matches.head(limit).reset_index(drop=True)
+        except (HTTPError, RequestException, ValueError) as e:
+            last_err = e
+            time.sleep(0.8 * (2 ** i))
+    raise RuntimeError(f"ECB dataflow search failed after retries: {last_err}")
             q = query.lower()
             matches = all_flows[
                 all_flows.apply(
@@ -163,6 +176,41 @@ def ecb_fetch_many(flow_id: str, series_keys: List[str], start: date, end: date)
     df = pd.concat(frames, axis=1)
     df.index.name = "Date"
     return df
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def ecb_fetch_dataflows_xml() -> pd.DataFrame:
+    """Fetch dataflows using SDMX-ML (XML), which the ECB Data Portal always supports.
+    Returns DataFrame with [flow_id, name].
+    """
+    url = f"{ECB_BASE}/dataflow"
+    headers = {"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    # Parse SDMX-ML
+    root = ET.fromstring(resp.content)
+    ns = {
+        "mes": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message",
+        "str": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure",
+        "com": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common",
+    }
+    flows = []
+    for df in root.findall('.//str:Dataflow', namespaces=ns):
+        fid = df.get('{http://www.w3.org/2001/XMLSchema-instance}id') or df.get('id')
+        if not fid:
+            fid_el = df.find('str:ID', ns)
+            fid = fid_el.text if fid_el is not None else None
+        # Name in English if available
+        name_el = None
+        for n in df.findall('com:Name', ns):
+            if (n.get('{http://www.w3.org/XML/1998/namespace}lang') or '').startswith('en'):
+                name_el = n
+                break
+        if name_el is None:
+            name_el = df.find('com:Name', ns)
+        name_txt = name_el.text if name_el is not None else ''
+        if fid:
+            flows.append({"flow_id": fid, "name": name_txt})
+    return pd.DataFrame(flows)
 
 # -------------------- UI -------------------- #
 st.set_page_config(page_title=APP_TITLE, layout="wide")
