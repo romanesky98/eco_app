@@ -37,6 +37,48 @@ DEFAULT_END = date.today()
 ECB_BASE = "https://data-api.ecb.europa.eu/service"
 
 # -------------------- Helpers -------------------- #
+@st.cache_data(show_spinner=True)
+def ecb_list_series_keys(flow_id: str, max_rows: int = 5000) -> pd.DataFrame:
+    """Return a DataFrame of available series keys for a given flow by calling
+    /data/{flow}?detail=serieskeysonly and parsing the CSV.
+    The DataFrame includes:
+      - series_key (dot-joined dimension codes)
+      - dimension columns as provided by ECB (e.g., FREQ, CURRENCY, ...)
+    """
+    if not flow_id:
+        return pd.DataFrame()
+    url = f"{ECB_BASE}/data/{flow_id}"
+    params = {
+        "detail": "serieskeysonly",
+        "format": "csvdata",
+    }
+    headers = {"Accept": "text/csv"}
+    r = requests.get(url, params=params, headers=headers, timeout=60)
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text))
+    if df.empty:
+        return pd.DataFrame()
+    # Heuristic: keep likely dimension columns (all-caps, no spaces), exclude known non-dim metadata
+    exclude = {
+        "TIME_PERIOD","OBS_VALUE","TITLE","TITLE_COMPL","UNIT","UNIT_MULT","DECIMALS",
+        "TIME_FORMAT","OBS_STATUS","OBS_CONF","OBS_PRE_BREAK","OBS_COM",
+    }
+    dim_cols = [c for c in df.columns if c.isupper() and (" " not in c) and c not in exclude]
+    # Some CSVs include a SERIES_KEY column already; prefer it if present
+    if "SERIES_KEY" in df.columns:
+        df["series_key"] = df["SERIES_KEY"].astype(str)
+    else:
+        # Build a dot-joined key from dimension columns in their CSV order
+        df["series_key"] = df[dim_cols].astype(str).agg(".".join, axis=1)
+    # Drop duplicates and limit rows
+    out = df.drop_duplicates(subset=["series_key"]).copy()
+    if max_rows:
+        out = out.head(max_rows)
+    # Keep series_key first for convenience
+    ordered_cols = ["series_key"] + [c for c in dim_cols if c in out.columns]
+    return out[ordered_cols]
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def ecb_fetch_dataflows_xml() -> pd.DataFrame:
     """Fetch dataflows using SDMX-ML (XML), which the ECB Data Portal always supports.
@@ -187,9 +229,41 @@ with explore_tab:
         if not results_df.empty:
             flows = results_df["flow_id"].tolist()
             chosen_flow = st.selectbox("Dataset (flow)", options=flows, index=0)
+        # Series key discovery UI
+        st.markdown("**Browse available series**")
+        max_rows = st.slider("Max keys to load", min_value=200, max_value=20000, step=200, value=3000, help="Upper bound to avoid massive downloads on very large datasets")
+        list_keys = st.button("List series for selected flow", use_container_width=True)
+        series_keys_list = pd.DataFrame()
+        if chosen_flow and list_keys:
+            try:
+                series_keys_list = ecb_list_series_keys(chosen_flow, max_rows)
+                if series_keys_list.empty:
+                    st.warning("No series keys returned by the API for this flow (or the dataset is restricted).")
+                else:
+                    # Filter box
+                    key_filter = st.text_input("Filter keys (contains)", placeholder="type to filter...")
+                    show_df = series_keys_list
+                    if key_filter.strip():
+                        q = key_filter.lower()
+                        show_df = show_df[show_df.apply(lambda r: q in r.to_string().lower(), axis=1)]
+                    st.dataframe(show_df, use_container_width=True, hide_index=True)
+                    # Multiselect from keys
+                    selected_from_list = st.multiselect(
+                        "Select series from table",
+                        options=show_df["series_key"].tolist(),
+                    )
+            except Exception as e:
+                st.error(f"Failed to list series keys: {e}")
+                selected_from_list = []
+        else:
+            selected_from_list = []
+
+        # Manual entry still supported
         series_text = st.text_input("Series keys (comma-separated)", placeholder="EXR.D.USD.EUR.SP00.A, EXR.D.GBP.EUR.SP00.A")
-        series_keys = [s.strip() for s in series_text.split(",") if s.strip()]
-        st.caption("Tip: Keys are dot-separated dimension codes specific to each dataset. Check ECB Data Portal for structure.")
+        manual_keys = [s.strip() for s in series_text.split(",") if s.strip()]
+        # Combine selections and dedupe
+        series_keys = list(dict.fromkeys(selected_from_list + manual_keys))
+        st.caption("Tip: Keys are dot-separated dimension codes specific to each dataset. Use the button above to browse actual available keys.")
 
     st.markdown("---")
 
