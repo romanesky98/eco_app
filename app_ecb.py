@@ -38,52 +38,37 @@ ECB_BASE = "https://data-api.ecb.europa.eu/service"
 
 # -------------------- Helpers -------------------- #
 @st.cache_data(show_spinner=False, ttl=3600)
-def ecb_fetch_dataflows() -> pd.DataFrame:
-    """Fetch all dataflows once (cached for 1 hour).
-    Tries multiple Accept/format combinations to satisfy the ECB Data Portal and avoid 406/unsupported content.
-    Returns a DataFrame with columns [flow_id, name].
+def ecb_fetch_dataflows_xml() -> pd.DataFrame:
+    """Fetch dataflows using SDMX-ML (XML), which the ECB Data Portal always supports.
+    Returns DataFrame with [flow_id, name].
     """
     url = f"{ECB_BASE}/dataflow"
-
-    header_options = [
-        {"Accept": "application/vnd.sdmx.structure+json;version=1.0"},
-        {"Accept": "application/vnd.sdmx.dataflow+json;version=1.0"},
-        {"Accept": "application/vnd.sdmx+json;version=1.0"},
-        {"Accept": "application/json"},
-        {},
-        {"Accept": "*/*"},
-    ]
-    param_options = [
-        {},
-        {"format": "sdmx-json"},
-        {"format": "jsondata"},
-    ]
-
-    last_err = None
-    for headers in header_options:
-        for params in param_options:
-            try:
-                resp = requests.get(url, headers=headers, params=params, timeout=30)
-                resp.raise_for_status()
-                ctype = resp.headers.get("Content-Type", "")
-                # Some gateways reply XML by default; skip if not JSON
-                if "json" not in ctype.lower():
-                    continue
-                j = resp.json()
-                flows = j.get("dataflows", {}).get("dataflow", [])
-                rows = []
-                for f in flows:
-                    flow_id = f.get("id")
-                    names = f.get("name", [])
-                    name_en = next((n.get("#text") for n in names if str(n.get("@xml:lang", "en")).startswith("en") and "#text" in n), None)
-                    name_any = name_en or (names[0].get("#text") if names else "")
-                    rows.append({"flow_id": flow_id, "name": name_any})
-                if rows:
-                    return pd.DataFrame(rows)
-            except Exception as e:
-                last_err = e
-                continue
-    raise RuntimeError(f"Unable to fetch dataflows from ECB endpoint with any Accept/format combination: {last_err}")
+    headers = {"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    root = ET.fromstring(resp.content)
+    ns = {
+        "mes": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message",
+        "str": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure",
+        "com": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common",
+    }
+    flows = []
+    for df in root.findall('.//str:Dataflow', namespaces=ns):
+        fid = df.get('{http://www.w3.org/2001/XMLSchema-instance}id') or df.get('id')
+        if not fid:
+            fid_el = df.find('str:ID', ns)
+            fid = fid_el.text if fid_el is not None else None
+        name_el = None
+        for n in df.findall('com:Name', ns):
+            if (n.get('{http://www.w3.org/XML/1998/namespace}lang') or '').startswith('en'):
+                name_el = n
+                break
+        if name_el is None:
+            name_el = df.find('com:Name', ns)
+        name_txt = name_el.text if name_el is not None else ''
+        if fid:
+            flows.append({"flow_id": fid, "name": name_txt})
+    return pd.DataFrame(flows)
 
 @st.cache_data(show_spinner=False)
 def ecb_search_dataflows_resilient(query: str, limit: int = 50) -> pd.DataFrame:
@@ -95,18 +80,6 @@ def ecb_search_dataflows_resilient(query: str, limit: int = 50) -> pd.DataFrame:
     for i in range(5):
         try:
             all_flows = ecb_fetch_dataflows_xml()
-            q = query.lower()
-            matches = all_flows[
-                all_flows.apply(
-                    lambda r: q in str(r["name"]).lower() or q in str(r["flow_id"]).lower(),
-                    axis=1,
-                )
-            ]
-            return matches.head(limit).reset_index(drop=True)
-        except (HTTPError, RequestException, ValueError) as e:
-            last_err = e
-            time.sleep(0.8 * (2 ** i))
-    raise RuntimeError(f"ECB dataflow search failed after retries: {last_err}")
             q = query.lower()
             matches = all_flows[
                 all_flows.apply(
@@ -139,7 +112,6 @@ def ecb_fetch_series_csv(flow_id: str, series_key: str, start: date, end: date) 
     df["Date"] = pd.to_datetime(df["TIME_PERIOD"], errors="coerce")
     df = df.sort_values("Date")
     df = df.rename(columns={"OBS_VALUE": "Value"})
-    # Build a friendly label
     label_parts = []
     for c in [
         "TITLE",
@@ -177,41 +149,6 @@ def ecb_fetch_many(flow_id: str, series_keys: List[str], start: date, end: date)
     df.index.name = "Date"
     return df
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def ecb_fetch_dataflows_xml() -> pd.DataFrame:
-    """Fetch dataflows using SDMX-ML (XML), which the ECB Data Portal always supports.
-    Returns DataFrame with [flow_id, name].
-    """
-    url = f"{ECB_BASE}/dataflow"
-    headers = {"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}
-    resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
-    # Parse SDMX-ML
-    root = ET.fromstring(resp.content)
-    ns = {
-        "mes": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message",
-        "str": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure",
-        "com": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common",
-    }
-    flows = []
-    for df in root.findall('.//str:Dataflow', namespaces=ns):
-        fid = df.get('{http://www.w3.org/2001/XMLSchema-instance}id') or df.get('id')
-        if not fid:
-            fid_el = df.find('str:ID', ns)
-            fid = fid_el.text if fid_el is not None else None
-        # Name in English if available
-        name_el = None
-        for n in df.findall('com:Name', ns):
-            if (n.get('{http://www.w3.org/XML/1998/namespace}lang') or '').startswith('en'):
-                name_el = n
-                break
-        if name_el is None:
-            name_el = df.find('com:Name', ns)
-        name_txt = name_el.text if name_el is not None else ''
-        if fid:
-            flows.append({"flow_id": fid, "name": name_txt})
-    return pd.DataFrame(flows)
-
 # -------------------- UI -------------------- #
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
@@ -224,7 +161,6 @@ with st.sidebar:
     st.markdown("### Help")
     st.caption("Search a dataset (flow), pick its ID, then paste full series keys. Example: EXR.D.USD.EUR.SP00.A")
 
-# Shared state
 results_df: pd.DataFrame = pd.DataFrame()
 chosen_flow = st.text_input("Selected dataset (flow ID)", placeholder="e.g., EXR, ICP, BSI, MNA")
 
