@@ -97,8 +97,9 @@ def fetch_dsd(flow_id: str) -> Dict:
 @st.cache_data(show_spinner=True)
 def list_series_catalog(flow_id: str, max_rows: int = 50000) -> pd.DataFrame:
     """Return a catalog of available series for a flow using `detail=serieskeysonly` CSV.
-    Output columns: key, name, plus any dimension columns found.
-    Uses SERIES_KEY when provided; falls back to concatenating dimension columns in CSV order.
+    Output columns: name, key, plus any dimension columns found.
+    1) Prefer provided human labels (TITLE_COMPL > TITLE)
+    2) Else derive a readable name from the most-informative dimension columns.
     """
     if not flow_id:
         return pd.DataFrame()
@@ -109,24 +110,35 @@ def list_series_catalog(flow_id: str, max_rows: int = 50000) -> pd.DataFrame:
     raw = pd.read_csv(io.StringIO(r.text))
     if raw.empty:
         return pd.DataFrame()
+
     # Build key
     if "SERIES_KEY" in raw.columns:
         raw["key"] = raw["SERIES_KEY"].astype(str)
     else:
-        # Heuristic: join all-uppercase, no-space columns except known observation/meta fields
         exclude = {"TIME_PERIOD","OBS_VALUE","DECIMALS","TIME_FORMAT","OBS_STATUS","OBS_CONF","OBS_PRE_BREAK","OBS_COM"}
         dim_cols = [c for c in raw.columns if c.isupper() and (" " not in c) and c not in exclude and not c.startswith("OBS_")]
         if not dim_cols:
             raise RuntimeError("Could not infer series key columns from catalog CSV.")
         raw["key"] = raw[dim_cols].astype(str).agg(".".join, axis=1)
-    # Human name: prefer TITLE_COMPL > TITLE > key
+
+    # Human name
     if "TITLE_COMPL" in raw.columns and raw["TITLE_COMPL"].notna().any():
         raw["name"] = raw["TITLE_COMPL"].astype(str)
     elif "TITLE" in raw.columns and raw["TITLE"].notna().any():
         raw["name"] = raw["TITLE"].astype(str)
     else:
-        raw["name"] = raw["key"].astype(str)
-    # Order and limit
+        # Derive: choose the most-informative dimension columns (highest nunique, excluding noisy ones)
+        exclude2 = {"FREQ","UNIT","UNIT_MULT","DECIMALS"}
+        candidates = [c for c in raw.columns if c.isupper() and (" " not in c) and c not in exclude and c not in exclude2 and not c.startswith("OBS_")]
+        if candidates:
+            nun = raw[candidates].nunique(dropna=False).sort_values(ascending=False)
+            label_cols = [c for c in nun.index.tolist() if nun[c] > 1][:4]
+            if not label_cols:
+                label_cols = candidates[:3]
+            raw["name"] = raw[label_cols].astype(str).agg(" · ".join, axis=1)
+        else:
+            raw["name"] = raw["key"].astype(str)
+
     base_cols = ["name","key"]
     other_cols = [c for c in raw.columns if c not in base_cols and c not in {"SERIES_KEY"}]
     out = raw[base_cols + other_cols].drop_duplicates(subset=["key"]).copy()
@@ -248,21 +260,10 @@ with c2:
     manual = st.text_input("Or paste series keys (comma-separated)", placeholder="EXR.D.USD.EUR.SP00.A")
     manual_keys = [s.strip() for s in manual.split(',') if s.strip()]
 
-# 2) Build keys and fetch
+# 2) Build keys (from selections + manual) and fetch
 st.markdown("---")
-series_keys: List[str] = []
-series_keys = list(dict.fromkeys((selected_keys if 'selected_keys' in locals() else []) + manual_keys))
-st.markdown("---")
-series_keys: List[str] = []
-try:
-    if dim_ids:
-        series_keys = build_series_keys_from_selection(FLOW, dim_ids, SELECTED)
-except Exception as e:
-    st.error(str(e))
-
-# Merge manual keys and dedupe
-if manual_keys:
-    series_keys = list(dict.fromkeys(series_keys + manual_keys))
+series_keys: List[str] = list(dict.fromkeys((selected_keys if 'selected_keys' in locals() else []) + manual_keys))
+st.caption(f"Selected {len(series_keys)} series.")
 
 # Fetch button
 fetch_now = st.button("Fetch & plot selected series", type="primary")
