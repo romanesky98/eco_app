@@ -14,79 +14,32 @@ Base: https://data-api.ecb.europa.eu/service
 No API key required.
 
 Notes:
-- Search dataflows (datasets), then paste one or more full series keys for that flow.
-  Example for EXR (exchange rates): EXR.D.USD.EUR.SP00.A
+- Pick a dataset (flow) from the dropdown (loaded from ECB).
+- Browse/Filter **named** series and select them to plot.
+- We fetch the **full history** by default; adjust analysis in the second tab.
 """
 
 import io
-from datetime import date
 from typing import List
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from dateutil.relativedelta import relativedelta
 import requests
 import time
 from requests.exceptions import HTTPError, RequestException
 import xml.etree.ElementTree as ET
 
 APP_TITLE = "ECB Data Portal Explorer"
-DEFAULT_START = date.today() - relativedelta(years=10)
-DEFAULT_END = date.today()
 ECB_BASE = "https://data-api.ecb.europa.eu/service"
 
 # -------------------- Helpers -------------------- #
-@st.cache_data(show_spinner=True)
-def ecb_list_series_keys(flow_id: str, max_rows: int = 5000) -> pd.DataFrame:
-    """Return a DataFrame of available series keys for a given flow by calling
-    /data/{flow}?detail=serieskeysonly and parsing the CSV.
-    The DataFrame includes:
-      - series_key (dot-joined dimension codes)
-      - dimension columns as provided by ECB (e.g., FREQ, CURRENCY, ...)
-    """
-    if not flow_id:
-        return pd.DataFrame()
-    url = f"{ECB_BASE}/data/{flow_id}"
-    params = {
-        "detail": "serieskeysonly",
-        "format": "csvdata",
-    }
-    headers = {"Accept": "text/csv"}
-    r = requests.get(url, params=params, headers=headers, timeout=60)
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    if df.empty:
-        return pd.DataFrame()
-    # Heuristic: keep likely dimension columns (all-caps, no spaces), exclude known non-dim metadata
-    exclude = {
-        "TIME_PERIOD","OBS_VALUE","TITLE","TITLE_COMPL","UNIT","UNIT_MULT","DECIMALS",
-        "TIME_FORMAT","OBS_STATUS","OBS_CONF","OBS_PRE_BREAK","OBS_COM",
-    }
-    dim_cols = [c for c in df.columns if c.isupper() and (" " not in c) and c not in exclude]
-    # Some CSVs include a SERIES_KEY column already; prefer it if present
-    if "SERIES_KEY" in df.columns:
-        df["series_key"] = df["SERIES_KEY"].astype(str)
-    else:
-        # Build a dot-joined key from dimension columns in their CSV order
-        df["series_key"] = df[dim_cols].astype(str).agg(".".join, axis=1)
-    # Drop duplicates and limit rows
-    out = df.drop_duplicates(subset=["series_key"]).copy()
-    if max_rows:
-        out = out.head(max_rows)
-    # Keep series_key first for convenience
-    ordered_cols = ["series_key"] + [c for c in dim_cols if c in out.columns]
-    return out[ordered_cols]
-
-
 @st.cache_data(show_spinner=False, ttl=3600)
 def ecb_fetch_dataflows_xml() -> pd.DataFrame:
-    """Fetch dataflows using SDMX-ML (XML), which the ECB Data Portal always supports.
-    Returns DataFrame with [flow_id, name].
-    """
+    """Fetch dataflows using SDMX-ML (XML). Returns DataFrame [flow_id, name]."""
     url = f"{ECB_BASE}/dataflow"
     headers = {"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}
-    resp = requests.get(url, headers=headers, timeout=30)
+    resp = requests.get(url, headers=headers, timeout=45)
     resp.raise_for_status()
     root = ET.fromstring(resp.content)
     ns = {
@@ -100,6 +53,7 @@ def ecb_fetch_dataflows_xml() -> pd.DataFrame:
         if not fid:
             fid_el = df.find('str:ID', ns)
             fid = fid_el.text if fid_el is not None else None
+        # English name preferred
         name_el = None
         for n in df.findall('com:Name', ns):
             if (n.get('{http://www.w3.org/XML/1998/namespace}lang') or '').startswith('en'):
@@ -110,43 +64,69 @@ def ecb_fetch_dataflows_xml() -> pd.DataFrame:
         name_txt = name_el.text if name_el is not None else ''
         if fid:
             flows.append({"flow_id": fid, "name": name_txt})
-    return pd.DataFrame(flows)
+    df_flows = pd.DataFrame(flows)
+    df_flows["label"] = df_flows.apply(lambda r: f"{r['name']}  ({r['flow_id']})".strip(), axis=1)
+    return df_flows.sort_values("name", key=lambda s: s.str.lower())
 
-@st.cache_data(show_spinner=False)
-def ecb_search_dataflows_resilient(query: str, limit: int = 50) -> pd.DataFrame:
-    """Resilient dataflow search with exponential backoff retries."""
-    if not query.strip():
+@st.cache_data(show_spinner=True)
+def ecb_list_series(flow_id: str, max_rows: int = 10000) -> pd.DataFrame:
+    """List series for a flow using serieskeysonly CSV.
+    Returns DataFrame with columns: series_key, name (human title if present), plus dimension columns.
+    """
+    if not flow_id:
+        return pd.DataFrame()
+    url = f"{ECB_BASE}/data/{flow_id}"
+    params = {"detail": "serieskeysonly", "format": "csvdata"}
+    headers = {"Accept": "text/csv"}
+    r = requests.get(url, params=params, headers=headers, timeout=90)
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text))
+    if df.empty:
         return pd.DataFrame()
 
-    last_err = None
-    for i in range(5):
-        try:
-            all_flows = ecb_fetch_dataflows_xml()
-            q = query.lower()
-            matches = all_flows[
-                all_flows.apply(
-                    lambda r: q in str(r["name"]).lower() or q in str(r["flow_id"]).lower(),
-                    axis=1,
-                )
-            ]
-            return matches.head(limit).reset_index(drop=True)
-        except (HTTPError, RequestException, ValueError) as e:
-            last_err = e
-            time.sleep(0.8 * (2 ** i))
-    raise RuntimeError(f"ECB dataflow search failed after retries: {last_err}")
+    # Dimension columns (heuristic)
+    exclude = {
+        "TIME_PERIOD","OBS_VALUE","DECIMALS","TIME_FORMAT","OBS_STATUS","OBS_CONF","OBS_PRE_BREAK","OBS_COM",
+        # Keep TITLE columns for naming
+    }
+    dim_cols = [c for c in df.columns if c.isupper() and (" " not in c) and c not in exclude and not c.startswith("OBS_")]
+
+    # Create series_key
+    if "SERIES_KEY" in df.columns:
+        df["series_key"] = df["SERIES_KEY"].astype(str)
+    else:
+        df["series_key"] = df[dim_cols].astype(str).agg(".".join, axis=1)
+
+    # Build human-readable name: prefer TITLE_COMPL > TITLE; else join key dims
+    name_col = None
+    if "TITLE_COMPL" in df.columns and df["TITLE_COMPL"].notna().any():
+        name_col = "TITLE_COMPL"
+    elif "TITLE" in df.columns and df["TITLE"].notna().any():
+        name_col = "TITLE"
+
+    if name_col:
+        df["name"] = df[name_col].astype(str)
+    else:
+        # Compact composite label from key parts (skip generic freq if present)
+        parts_cols = [c for c in dim_cols if c != "FREQ"]
+        df["name"] = df[parts_cols].astype(str).agg(" / ".join, axis=1)
+
+    # Deduplicate and limit
+    out = df.drop_duplicates(subset=["series_key"]).copy()
+    if max_rows:
+        out = out.head(max_rows)
+
+    # Order columns
+    ordered = ["series_key", "name"] + [c for c in dim_cols if c in out.columns]
+    return out[ordered]
 
 @st.cache_data(show_spinner=False)
-def ecb_fetch_series_csv(flow_id: str, series_key: str, start: date, end: date) -> pd.DataFrame:
-    """Fetch a single ECB series using the CSV data endpoint and return a tidy DataFrame with Date and Value."""
-    params = {
-        "detail": "dataonly",
-        "startPeriod": start.isoformat(),
-        "endPeriod": end.isoformat(),
-        "format": "csvdata",
-    }
+def ecb_fetch_series_csv(flow_id: str, series_key: str) -> pd.DataFrame:
+    """Fetch a single series full history as CSV -> DataFrame indexed by Date with a nice column label."""
+    params = {"detail": "dataonly", "format": "csvdata"}
     url = f"{ECB_BASE}/data/{flow_id}/{series_key}"
     headers = {"Accept": "text/csv"}
-    r = requests.get(url, params=params, headers=headers, timeout=60)
+    r = requests.get(url, params=params, headers=headers, timeout=90)
     r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.text))
     if "TIME_PERIOD" not in df.columns or "OBS_VALUE" not in df.columns:
@@ -154,34 +134,26 @@ def ecb_fetch_series_csv(flow_id: str, series_key: str, start: date, end: date) 
     df["Date"] = pd.to_datetime(df["TIME_PERIOD"], errors="coerce")
     df = df.sort_values("Date")
     df = df.rename(columns={"OBS_VALUE": "Value"})
+    # Compose readable label from any available metadata
     label_parts = []
-    for c in [
-        "TITLE",
-        "TITLE_COMPL",
-        "CURRENCY",
-        "CURRENCY_DENOM",
-        "EXR_TYPE",
-        "EXR_SUFFIX",
-        "UNIT",
-        "UNIT_MULT",
-    ]:
+    for c in ["TITLE_COMPL", "TITLE", "CURRENCY", "CURRENCY_DENOM", "EXR_TYPE", "EXR_SUFFIX", "UNIT", "UNIT_MULT"]:
         if c in df.columns and pd.notna(df[c]).any():
             val = str(df[c].dropna().iloc[0])
             if val and val != "nan":
-                label_parts.append(f"{c.split('_')[0].title()}: {val}")
+                label_parts.append(val)
     label = f"{flow_id}:{series_key}"
     if label_parts:
-        label += " — " + ", ".join(label_parts)
-    out = df[["Date", "Value"]].copy()
-    out = out.set_index("Date").rename(columns={"Value": label})
+        label = " — ".join([label] + label_parts)
+    out = df[["Date", "Value"]].copy().set_index("Date")
+    out.columns = [label]
     return out
 
 @st.cache_data(show_spinner=False)
-def ecb_fetch_many(flow_id: str, series_keys: List[str], start: date, end: date) -> pd.DataFrame:
+def ecb_fetch_many(flow_id: str, series_keys: List[str]) -> pd.DataFrame:
     frames = []
     for key in series_keys:
         try:
-            s = ecb_fetch_series_csv(flow_id, key, start, end)
+            s = ecb_fetch_series_csv(flow_id, key)
             frames.append(s)
         except Exception as e:
             st.warning(f"Failed to fetch {flow_id}/{key}: {e}")
@@ -195,115 +167,118 @@ def ecb_fetch_many(flow_id: str, series_keys: List[str], start: date, end: date)
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
+# Sidebar: analysis controls only (no date preselection; full history is fetched)
 with st.sidebar:
-    st.markdown("### Date Range")
-    start_date = st.date_input("Start", value=DEFAULT_START)
-    end_date = st.date_input("End", value=DEFAULT_END)
-    st.markdown("---")
-    st.markdown("### Help")
-    st.caption("Search a dataset (flow), pick its ID, then paste full series keys. Example: EXR.D.USD.EUR.SP00.A")
+    st.markdown("### Analysis options")
+    norm_mode = st.selectbox(
+        "Normalize series (helps compare different units)",
+        options=["None", "Rebase to 100 at start", "Z-score (standardize)"]
+    )
+    preset_windows = [3, 6, 12, 24, 60]
+    windows = st.multiselect("Rolling mean windows (periods)", options=preset_windows, default=[6, 12])
+    custom_windows = st.text_input("Custom windows (comma-separated)", placeholder="e.g., 9, 18")
 
-results_df: pd.DataFrame = pd.DataFrame()
-chosen_flow = st.text_input("Selected dataset (flow ID)", placeholder="e.g., EXR, ICP, BSI, MNA")
+# Load all datasets for dropdown
+with st.spinner("Loading datasets from ECB..."):
+    all_flows = ecb_fetch_dataflows_xml()
 
 explore_tab, analyze_tab = st.tabs(["Explore", "Deep analysis"]) 
 
 with explore_tab:
     col1, col2 = st.columns([1, 1])
     with col1:
-        st.subheader("Search ECB datasets (dataflows)")
-        query = st.text_input("Keyword(s)", placeholder="e.g., exchange rate, HICP, GDP, M3")
-        limit = st.slider("Max results", min_value=10, max_value=200, value=50, step=10)
-        do_search = st.button("Search", type="primary", use_container_width=True)
-        if do_search:
-            try:
-                results_df = ecb_search_dataflows_resilient(query, limit)
-                if results_df.empty:
-                    st.warning("No matching datasets.")
-            except Exception as e:
-                st.error(f"Search failed: {e}")
-        if not results_df.empty:
-            st.dataframe(results_df, use_container_width=True, hide_index=True)
+        st.subheader("Choose a dataset (flow)")
+        # Optional filter box to quickly narrow the dropdown
+        flow_filter = st.text_input("Filter datasets (by name or id)", placeholder="e.g., exchange rate, EXR")
+        flows_df = all_flows
+        if flow_filter.strip():
+            q = flow_filter.lower()
+            flows_df = flows_df[flows_df.apply(lambda r: q in str(r["name"]).lower() or q in str(r["flow_id"]).lower(), axis=1)]
+        flow_labels = flows_df["label"].tolist()
+        default_index = 0 if len(flow_labels) else None
+        chosen_label = st.selectbox("Dataset (flow)", options=flow_labels, index=default_index)
+        # Map back to flow_id
+        chosen_flow = flows_df.loc[flows_df["label"] == chosen_label, "flow_id"].iloc[0] if flow_labels else ""
+        st.caption(f"Flow selected: **{chosen_flow}**")
+
     with col2:
-        st.subheader("Pick dataset and series keys")
-        if not results_df.empty:
-            flows = results_df["flow_id"].tolist()
-            chosen_flow = st.selectbox("Dataset (flow)", options=flows, index=0)
-        # Series key discovery UI
-        st.markdown("**Browse available series**")
-        max_rows = st.slider("Max keys to load", min_value=200, max_value=20000, step=200, value=3000, help="Upper bound to avoid massive downloads on very large datasets")
-        list_keys = st.button("List series for selected flow", use_container_width=True)
-        series_keys_list = pd.DataFrame()
+        st.subheader("Browse & select series")
+        max_rows = st.slider("Max keys to load", min_value=200, max_value=50000, step=200, value=5000)
+        list_keys = st.button("Load series for this dataset", use_container_width=True)
+
+        selected_from_list: List[str] = []
+        selected_names: List[str] = []
         if chosen_flow and list_keys:
             try:
-                series_keys_list = ecb_list_series_keys(chosen_flow, max_rows)
-                if series_keys_list.empty:
-                    st.warning("No series keys returned by the API for this flow (or the dataset is restricted).")
+                series_df = ecb_list_series(chosen_flow, max_rows=max_rows)
+                if series_df.empty:
+                    st.warning("No series returned (dataset might be restricted or empty).")
                 else:
-                    # Filter box
-                    key_filter = st.text_input("Filter keys (contains)", placeholder="type to filter...")
-                    show_df = series_keys_list
+                    # Filter series by text
+                    key_filter = st.text_input("Filter series (by name or key)", placeholder="type to filter...")
+                    show_df = series_df
                     if key_filter.strip():
                         q = key_filter.lower()
-                        show_df = show_df[show_df.apply(lambda r: q in r.to_string().lower(), axis=1)]
+                        show_df = series_df[series_df.apply(lambda r: q in str(r["name"]).lower() or q in str(r["series_key"]).lower(), axis=1)]
                     st.dataframe(show_df, use_container_width=True, hide_index=True)
-                    # Multiselect from keys
-                    selected_from_list = st.multiselect(
-                        "Select series from table",
-                        options=show_df["series_key"].tolist(),
-                    )
+
+                    # Build labeled options "name — series_key"
+                    options = (show_df["name"] + " — " + show_df["series_key"]).tolist()
+                    pick = st.multiselect("Select series", options=options)
+                    selected_from_list = [p.split(" — ")[-1] for p in pick]
+                    selected_names = [p.split(" — ")[0] for p in pick]
             except Exception as e:
-                st.error(f"Failed to list series keys: {e}")
-                selected_from_list = []
-        else:
-            selected_from_list = []
+                st.error(f"Failed to list series: {e}")
 
         # Manual entry still supported
-        series_text = st.text_input("Series keys (comma-separated)", placeholder="EXR.D.USD.EUR.SP00.A, EXR.D.GBP.EUR.SP00.A")
-        manual_keys = [s.strip() for s in series_text.split(",") if s.strip()]
-        # Combine selections and dedupe
+        manual_text = st.text_input("Add series keys (comma-separated)", placeholder="EXR.D.USD.EUR.SP00.A, EXR.D.GBP.EUR.SP00.A")
+        manual_keys = [s.strip() for s in manual_text.split(",") if s.strip()]
+
         series_keys = list(dict.fromkeys(selected_from_list + manual_keys))
-        st.caption("Tip: Keys are dot-separated dimension codes specific to each dataset. Use the button above to browse actual available keys.")
+        st.caption("Tip: Use the table & filter above to find named series; you can also paste keys manually.")
 
     st.markdown("---")
 
+    # Fetch & plot full history
     df = pd.DataFrame()
     if chosen_flow and series_keys:
-        df = ecb_fetch_many(chosen_flow, series_keys, start_date, end_date)
+        df = ecb_fetch_many(chosen_flow, series_keys)
         if df.empty:
-            st.warning("No data for the selected keys/range.")
+            st.warning("No data for the selected keys.")
         else:
-            fig = px.line(df, x=df.index, y=df.columns, labels={"x": "Date", "value": "Value", "variable": "Series"})
+            # Apply normalization requested in sidebar (for immediate visual comparison)
+            base_df = df.copy()
+            if norm_mode == "Rebase to 100 at start":
+                base_df = base_df.apply(lambda s: (s / s.dropna().iloc[0]) * 100)
+            elif norm_mode == "Z-score (standardize)":
+                base_df = base_df.apply(lambda s: (s - s.mean()) / s.std(ddof=0))
+
+            fig = px.line(base_df, x=base_df.index, y=base_df.columns,
+                          labels={"x": "Date", "value": "Value", "variable": "Series"})
             fig.update_layout(legend_title_text="Series", hovermode="x unified")
             st.plotly_chart(fig, use_container_width=True)
 
-            with st.expander("Summary stats"):
-                st.dataframe(df.describe().T, use_container_width=True)
+            with st.expander("Summary stats (on transformed data if applied)"):
+                st.dataframe(base_df.describe().T, use_container_width=True)
 
             csv = df.to_csv(index=True).encode("utf-8")
-            st.download_button("Download CSV", data=csv, file_name="ecb_data.csv", mime="text/csv", use_container_width=True)
+            st.download_button("Download raw CSV", data=csv, file_name="ecb_data.csv", mime="text/csv", use_container_width=True)
     else:
-        st.info("Search a dataset (flow) and enter at least one full series key.")
+        st.info("Choose a dataset and at least one series to plot.")
 
 with analyze_tab:
-    st.subheader("Deep analysis: rolling means & normalization")
+    st.subheader("Deep analysis: rolling means")
     if 'df' not in locals() or df is None or df.empty:
         st.info("Load one or more series in the **Explore** tab first.")
     else:
-        norm_mode = st.selectbox(
-            "Normalize series (helps compare different units)",
-            options=["None", "Rebase to 100 at start", "Z-score (standardize)"]
-        )
-        preset_windows = [3, 6, 12, 24, 60]
-        windows = st.multiselect("Rolling mean windows (in periods)", options=preset_windows, default=[6, 12])
-        custom_windows = st.text_input("Add custom windows (comma-separated integers)", placeholder="e.g., 9, 18")
+        # Build list of windows from sidebar + custom
+        windows_list = windows[:]
         if custom_windows.strip():
             try:
                 extra = [int(x.strip()) for x in custom_windows.split(',') if x.strip()]
-                windows = sorted(list(dict.fromkeys(windows + extra)))
+                windows_list = sorted(list(dict.fromkeys(windows_list + extra)))
             except Exception:
                 st.warning("Couldn't parse custom windows; please enter integers separated by commas.")
-        show_raw = st.checkbox("Show raw series", value=True)
 
         base_df = df.copy()
         if norm_mode == "Rebase to 100 at start":
@@ -312,11 +287,12 @@ with analyze_tab:
             base_df = base_df.apply(lambda s: (s - s.mean()) / s.std(ddof=0))
 
         long_frames = []
+        show_raw = st.checkbox("Show raw series", value=True)
         if show_raw:
             raw_long = base_df.reset_index().melt(id_vars=["Date"], var_name="Series", value_name="Value")
             raw_long["Line"] = "Raw"
             long_frames.append(raw_long)
-        for w in windows:
+        for w in windows_list:
             ma = base_df.rolling(window=w, min_periods=w).mean()
             ma_long = ma.reset_index().melt(id_vars=["Date"], var_name="Series", value_name="Value")
             ma_long["Line"] = f"MA{w}"
