@@ -1,410 +1,364 @@
 """
-Streamlit ECB Data Portal Explorer (uses data-api.ecb.europa.eu)
+ECB Data Portal Explorer — intuitive & robust (data-api.ecb.europa.eu)
 
-Quick start:
-1) Save this file as app_ecb.py
-2) Create a virtual env and install deps:
-   pip install streamlit plotly pandas python-dateutil requests
-3) Run the app:
-   streamlit run app_ecb.py
+✔ End-to-end discovery via **dropdowns** (datasets & dimension values)
+✔ No date preselection (pulls full history by default)
+✔ Fetch series by **building keys from dimensions** (no guessing)
+✔ Resilient to format/negotiation issues (uses SDMX-ML for structures, CSV for data)
+✔ Clean data frames: wide (for charts) and tidy long (for export/analysis)
 
-Data source: European Central Bank Data Portal (SDMX 2.1 REST)
-API docs: https://data.ecb.europa.eu/help/api/overview
-Base: https://data-api.ecb.europa.eu/service
-No API key required.
+How to run
+----------
+1) Save as `app_ecb.py`
+2) Install deps: `pip install streamlit plotly pandas python-dateutil requests`
+3) Run: `streamlit run app_ecb.py`
 
-Notes:
-- Pick a dataset (flow) from the dropdown (loaded from ECB).
-- Browse/Filter **named** series and select them to plot.
-- We fetch the **full history** by default; adjust analysis in the second tab.
+Docs: https://data.ecb.europa.eu/help/api/overview  ·  Base: https://data-api.ecb.europa.eu/service
 """
 
+from __future__ import annotations
 import io
-from typing import List
+import itertools
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import plotly.express as px
-import streamlit as st
 import requests
-import time
-from requests.exceptions import HTTPError, RequestException
+import streamlit as st
 import xml.etree.ElementTree as ET
 
 APP_TITLE = "ECB Data Portal Explorer"
-ECB_BASE = "https://data-api.ecb.europa.eu/service"
+BASE = "https://data-api.ecb.europa.eu/service"
 
-# -------------------- Helpers -------------------- #
+# ------------------------------
+# Helpers: SDMX structure (XML)
+# ------------------------------
+NS = {
+    "mes": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message",
+    "str": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure",
+    "com": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common",
+}
+
 @st.cache_data(show_spinner=False, ttl=3600)
-def ecb_get_dsd_ref(flow_id: str):
-    """Return (agencyID, id, version) for the DataStructure referenced by a given dataflow.
-    Falls back to (None, flow_id, None) if not found.
-    """
-    if not flow_id:
-        return (None, flow_id, None)
-    url = f"{ECB_BASE}/dataflow/{flow_id}"
-    headers = {"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}
-    # Ask for references to include linked structures
-    resp = requests.get(url, headers=headers, params={"references": "all"}, timeout=45)
+def fetch_dataflows() -> pd.DataFrame:
+    """List all datasets (dataflows). Returns columns: flow_id, name, label."""
+    resp = requests.get(f"{BASE}/dataflow", headers={"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}, timeout=45)
     resp.raise_for_status()
     root = ET.fromstring(resp.content)
-    ns = {
-        "mes": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message",
-        "str": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure",
-    }
-    df = root.find('.//str:Dataflow', ns)
-    if df is None:
-        return (None, flow_id, None)
-    # Structure/Ref with class="DataStructure"
-    ref = df.find('.//str:Structure/str:Ref', ns)
-    if ref is not None:
-        if (ref.get('class') or '').lower() == 'datastructure':
-            agency = ref.get('agencyID')
-            did = ref.get('id')
-            ver = ref.get('version')
-            return (agency, did or flow_id, ver)
-    # Some providers use URN instead of Ref
-    urn_el = df.find('.//str:Structure/str:URN', ns)
-    if urn_el is not None and urn_el.text:
-        # URN like: urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=ECB:EXR(1.0)
-        text = urn_el.text
+    rows = []
+    for df in root.findall('.//str:Dataflow', NS):
+        fid = df.get('{http://www.w3.org/2001/XMLSchema-instance}id') or df.get('id')
+        if not fid:
+            el = df.find('str:ID', NS)
+            fid = el.text if el is not None else None
+        # English name preferred
+        name_el = None
+        for n in df.findall('com:Name', NS):
+            if (n.get('{http://www.w3.org/XML/1998/namespace}lang') or '').startswith('en'):
+                name_el = n; break
+        if name_el is None:
+            name_el = df.find('com:Name', NS)
+        name = name_el.text if name_el is not None else ''
+        if fid:
+            rows.append({"flow_id": fid, "name": name, "label": f"{name} ({fid})"})
+    out = pd.DataFrame(rows)
+    return out.sort_values("name", key=lambda s: s.str.lower()).reset_index(drop=True)
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_dsd_ref(flow_id: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return (agencyID, id, version) for the DataStructure linked to a flow."""
+    resp = requests.get(f"{BASE}/dataflow/{flow_id}", headers={"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}, params={"references":"all"}, timeout=45)
+    resp.raise_for_status()
+    root = ET.fromstring(resp.content)
+    df = root.find('.//str:Dataflow', NS)
+    if df is None: return (None, flow_id, None)
+    ref = df.find('.//str:Structure/str:Ref', NS)
+    if ref is not None and (ref.get('class') or '').lower()=="datastructure":
+        return (ref.get('agencyID'), ref.get('id'), ref.get('version'))
+    urn = df.find('.//str:Structure/str:URN', NS)
+    if urn is not None and urn.text:
         try:
-            body = text.split('=')[1]
-            agency_id, rest = body.split(':', 1)
+            body = urn.text.split('=')[1]
+            agency, rest = body.split(':',1)
             if '(' in rest:
-                dsd_id, ver = rest.strip(')').split('(')
+                did, ver = rest[:-1].split('(')
             else:
-                dsd_id, ver = rest, None
-            return (agency_id, dsd_id, ver)
+                did, ver = rest, None
+            return (agency, did, ver)
         except Exception:
             pass
     return (None, flow_id, None)
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def ecb_get_dimension_order(flow_id: str) -> List[str]:
-    """Fetch the DSD (structure) for a flow and return the ordered list of dimension IDs.
-    Tries agency/id/version combinations per the Dataflow's Structure reference.
-    """
-    if not flow_id:
-        return []
-    agency, dsd_id, version = ecb_get_dsd_ref(flow_id)
-    candidates = []
-    if agency and dsd_id and version:
-        candidates.append(f"{agency}/{dsd_id}/{version}")
-    if agency and dsd_id:
-        candidates.append(f"{agency}/{dsd_id}")
-    if dsd_id:
-        candidates.append(f"{dsd_id}")
-
-    headers = {"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}
-    ns = {"str": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure"}
-    for path in candidates:
-        try:
-            url = f"{ECB_BASE}/datastructure/{path}"
-            resp = requests.get(url, headers=headers, params={"references": "children"}, timeout=45)
-            if resp.status_code == 404:
-                continue
-            resp.raise_for_status()
-            root = ET.fromstring(resp.content)
-            dims = []
-            for dim in root.findall('.//str:DataStructure/str:DataStructureComponents/str:DimensionList/str:Dimension', ns):
-                dim_id = dim.get('id') or dim.get('{http://www.w3.org/2001/XMLSchema-instance}id')
-                if dim_id:
-                    dims.append(dim_id)
-            if dims:
-                return [d for d in dims if d.upper() != 'TIME_PERIOD']
-        except Exception:
-            continue
-    # Fallback: empty list (caller will use heuristic)
-    return []
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def ecb_fetch_dataflows_xml() -> pd.DataFrame:
-    """Fetch dataflows using SDMX-ML (XML). Returns DataFrame [flow_id, name]."""
-    url = f"{ECB_BASE}/dataflow"
-    headers = {"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}
-    resp = requests.get(url, headers=headers, timeout=45)
-    resp.raise_for_status()
-    root = ET.fromstring(resp.content)
-    ns = {
-        "mes": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message",
-        "str": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure",
-        "com": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common",
+def fetch_dsd(flow_id: str) -> Dict:
+    """Fetch DataStructure and return:
+    {
+      'dimensions': [ {'id': 'FREQ', 'name': 'Frequency', 'codelist': ('ECB','CL_FREQ','1.0'), 'codes': DataFrame[code,name]} , ...],
+      'dim_ids': ['FREQ','...']
     }
-    flows = []
-    for df in root.findall('.//str:Dataflow', namespaces=ns):
-        fid = df.get('{http://www.w3.org/2001/XMLSchema-instance}id') or df.get('id')
-        if not fid:
-            fid_el = df.find('str:ID', ns)
-            fid = fid_el.text if fid_el is not None else None
-        # English name preferred
-        name_el = None
-        for n in df.findall('com:Name', ns):
-            if (n.get('{http://www.w3.org/XML/1998/namespace}lang') or '').startswith('en'):
-                name_el = n
-                break
-        if name_el is None:
-            name_el = df.find('com:Name', ns)
-        name_txt = name_el.text if name_el is not None else ''
-        if fid:
-            flows.append({"flow_id": fid, "name": name_txt})
-    df_flows = pd.DataFrame(flows)
-    df_flows["label"] = df_flows.apply(lambda r: f"{r['name']}  ({r['flow_id']})".strip(), axis=1)
-    return df_flows.sort_values("name", key=lambda s: s.str.lower())
-
-@st.cache_data(show_spinner=True)
-def ecb_list_series(flow_id: str, max_rows: int = 10000) -> pd.DataFrame:
-    """List series for a flow using serieskeysonly CSV.
-    Returns DataFrame with columns: series_key, name (human title if present), plus dimension columns.
-    Builds series_key using the **official dimension order** from the flow's DSD when available.
     """
-    if not flow_id:
-        return pd.DataFrame()
-    url = f"{ECB_BASE}/data/{flow_id}"
-    params = {"detail": "serieskeysonly", "format": "csvdata"}
-    headers = {"Accept": "text/csv"}
-    r = requests.get(url, params=params, headers=headers, timeout=90)
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    if df.empty:
-        return pd.DataFrame()
+    agency, did, ver = get_dsd_ref(flow_id)
+    candidates = []
+    if agency and did and ver: candidates.append(f"{agency}/{did}/{ver}")
+    if agency and did: candidates.append(f"{agency}/{did}")
+    if did: candidates.append(did)
+    # fetch DSD
+    root = None
+    for path in candidates:
+        r = requests.get(f"{BASE}/datastructure/{path}", headers={"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}, params={"references":"children"}, timeout=45)
+        if r.status_code==404: continue
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        break
+    if root is None:
+        return {"dimensions": [], "dim_ids": []}
+    dims = []
+    for dim in root.findall('.//str:DataStructure/str:DataStructureComponents/str:DimensionList/str:Dimension', NS):
+        dim_id = dim.get('id') or dim.get('{http://www.w3.org/2001/XMLSchema-instance}id')
+        if not dim_id or dim_id.upper()=="TIME_PERIOD":
+            continue
+        # human-readable name
+        dname = None
+        for n in dim.findall('com:Name', NS):
+            if (n.get('{http://www.w3.org/XML/1998/namespace}lang') or '').startswith('en'):
+                dname = n.text; break
+        if dname is None:
+            n = dim.find('com:Name', NS)
+            dname = n.text if n is not None else dim_id
+        # codelist ref
+        cl_ref = dim.find('.//str:LocalRepresentation/str:Enumeration/str:Ref', NS)
+        cl_urn = dim.find('.//str:LocalRepresentation/str:Enumeration/str:URN', NS)
+        cl_tuple: Optional[Tuple[str,str,Optional[str]]] = None
+        if cl_ref is not None and (cl_ref.get('class') or '').lower()=="codelist":
+            cl_tuple = (cl_ref.get('agencyID'), cl_ref.get('id'), cl_ref.get('version'))
+        elif cl_urn is not None and cl_urn.text:
+            try:
+                body = cl_urn.text.split('=')[1]
+                agency, rest = body.split(':',1)
+                if '(' in rest:
+                    cid, ver = rest[:-1].split('(')
+                else:
+                    cid, ver = rest, None
+                cl_tuple = (agency, cid, ver)
+            except Exception:
+                pass
+        # fetch codes (if codelist exists)
+        codes_df = pd.DataFrame(columns=["code","name"])        
+        if cl_tuple:
+            a,cid,v = cl_tuple
+            paths = []
+            if a and cid and v: paths.append(f"{a}/{cid}/{v}")
+            if a and cid: paths.append(f"{a}/{cid}")
+            if cid: paths.append(cid)
+            for p in paths:
+                rc = requests.get(f"{BASE}/codelist/{p}", headers={"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}, timeout=45)
+                if rc.status_code==404: continue
+                rc.raise_for_status()
+                cl_root = ET.fromstring(rc.content)
+                rows=[]
+                for it in cl_root.findall('.//str:Code', NS):
+                    code = it.get('id') or it.get('{http://www.w3.org/2001/XMLSchema-instance}id')
+                    nm_el=None
+                    for nn in it.findall('com:Name', NS):
+                        if (nn.get('{http://www.w3.org/XML/1998/namespace}lang') or '').startswith('en'):
+                            nm_el = nn; break
+                    if nm_el is None:
+                        nm_el = it.find('com:Name', NS)
+                    nm = nm_el.text if nm_el is not None else code
+                    rows.append({"code":code, "name":nm})
+                codes_df = pd.DataFrame(rows)
+                break
+        dims.append({"id": dim_id, "name": dname, "codes": codes_df})
+    return {"dimensions": dims, "dim_ids": [d["id"] for d in dims]}
 
-    # Dimension order from DSD
-    dsd_dims = ecb_get_dimension_order(flow_id)
-
-    # Candidate columns present in the CSV (uppercase, no spaces)
-    csv_cols = [c for c in df.columns if c.isupper() and (" " not in c)]
-
-    # Create series_key with precedence: SERIES_KEY -> DSD order -> heuristic
-    if "SERIES_KEY" in df.columns:
-        df["series_key"] = df["SERIES_KEY"].astype(str)
-    elif dsd_dims:
-        dims_present = [d for d in dsd_dims if d in df.columns]
-        if dims_present:
-            df["series_key"] = df[dims_present].astype(str).agg(".".join, axis=1)
-        else:
-            df["series_key"] = df[csv_cols].astype(str).agg(".".join, axis=1)
-    else:
-        df["series_key"] = df[csv_cols].astype(str).agg(".".join, axis=1)
-
-    # Build human-readable name: prefer TITLE_COMPL > TITLE; else join key dims (without FREQ if present)
-    name_col = None
-    if "TITLE_COMPL" in df.columns and df["TITLE_COMPL"].notna().any():
-        name_col = "TITLE_COMPL"
-    elif "TITLE" in df.columns and df["TITLE"].notna().any():
-        name_col = "TITLE"
-
-    if name_col:
-        df["name"] = df[name_col].astype(str)
-    else:
-        parts_cols = [c for c in (dsd_dims or csv_cols) if c != "FREQ" and c in df.columns]
-        df["name"] = df[parts_cols].astype(str).agg(" / ".join, axis=1)
-
-    # Deduplicate and limit
-    out = df.drop_duplicates(subset=["series_key"]).copy()
-    if max_rows:
-        out = out.head(max_rows)
-
-    # Order columns: series_key, name, then dimensions per DSD order if available
-    ordered_dims = [c for c in (dsd_dims or csv_cols) if c in out.columns]
-    ordered = ["series_key", "name"] + ordered_dims
-    return out[ordered]
+# ------------------------------
+# Helpers: data fetching (CSV)
+# ------------------------------
+@st.cache_data(show_spinner=False)
+def build_series_keys_from_selection(flow_id: str, dim_ids: List[str], selected: Dict[str, List[str]]) -> List[str]:
+    """Create series keys from a dict {DIM: [codes,...]}. Empty list -> wildcard for that DIM.
+    Limits cartesian size to protect UI.
+    """
+    # If a dim has no selection, use [''] to wildcard that position
+    ordered_lists = [ (selected.get(dim) or [""]) for dim in dim_ids ]
+    # Limit
+    total = 1
+    for lst in ordered_lists:
+        total *= max(1, len(lst))
+        if total > 5000:
+            raise RuntimeError("Selection expands to >5000 series keys. Narrow your filters.")
+    keys = []
+    for combo in itertools.product(*ordered_lists):
+        keys.append(".".join(combo))
+    return keys
 
 @st.cache_data(show_spinner=False)
-def ecb_fetch_series_csv(flow_id: str, series_key: str) -> pd.DataFrame:
-    """Fetch a single series full history as CSV -> DataFrame indexed by Date with a nice column label."""
-    params = {"detail": "dataonly", "format": "csvdata"}
-    url = f"{ECB_BASE}/data/{flow_id}/{series_key}"
-    headers = {"Accept": "text/csv"}
-    r = requests.get(url, params=params, headers=headers, timeout=90)
+def fetch_series_csv(flow_id: str, series_key: str) -> pd.DataFrame:
+    """Fetch full history for one series as wide frame with named column."""
+    url = f"{BASE}/data/{flow_id}/{series_key}"
+    r = requests.get(url, params={"detail":"dataonly", "format":"csvdata"}, headers={"Accept":"text/csv"}, timeout=90)
     r.raise_for_status()
     df = pd.read_csv(io.StringIO(r.text))
     if "TIME_PERIOD" not in df.columns or "OBS_VALUE" not in df.columns:
-        raise RuntimeError("Unexpected CSV format from ECB Data Portal.")
+        raise RuntimeError("Unexpected CSV from ECB.")
     df["Date"] = pd.to_datetime(df["TIME_PERIOD"], errors="coerce")
     df = df.sort_values("Date")
-    df = df.rename(columns={"OBS_VALUE": "Value"})
-    # Compose readable label from any available metadata
-    label_parts = []
-    for c in ["TITLE_COMPL", "TITLE", "CURRENCY", "CURRENCY_DENOM", "EXR_TYPE", "EXR_SUFFIX", "UNIT", "UNIT_MULT"]:
-        if c in df.columns and pd.notna(df[c]).any():
-            val = str(df[c].dropna().iloc[0])
-            if val and val != "nan":
-                label_parts.append(val)
+    # Compose label
     label = f"{flow_id}:{series_key}"
-    if label_parts:
-        label = " — ".join([label] + label_parts)
-    out = df[["Date", "Value"]].copy().set_index("Date")
-    out.columns = [label]
+    for c in ["TITLE_COMPL","TITLE","UNIT","CURRENCY","CURRENCY_DENOM","EXR_TYPE","EXR_SUFFIX"]:
+        if c in df.columns and pd.notna(df[c]).any():
+            label = f"{label} — {str(df[c].dropna().iloc[0])}"
+            break
+    out = df[["Date","OBS_VALUE"]].rename(columns={"OBS_VALUE":label}).set_index("Date")
     return out
 
 @st.cache_data(show_spinner=False)
-def ecb_fetch_many(flow_id: str, series_keys: List[str]) -> pd.DataFrame:
-    frames = []
-    for key in series_keys:
+def fetch_many(flow_id: str, series_keys: List[str]) -> pd.DataFrame:
+    frames=[]
+    for k in series_keys:
         try:
-            s = ecb_fetch_series_csv(flow_id, key)
-            frames.append(s)
+            frames.append(fetch_series_csv(flow_id, k))
         except Exception as e:
-            st.warning(f"Failed to fetch {flow_id}/{key}: {e}")
+            st.warning(f"Failed to fetch {flow_id}/{k}: {e}")
     if not frames:
         return pd.DataFrame()
     df = pd.concat(frames, axis=1)
     df.index.name = "Date"
     return df
 
-# -------------------- UI -------------------- #
+# ------------------------------
+# UI
+# ------------------------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
-# Sidebar: analysis controls only (no date preselection; full history is fetched)
 with st.sidebar:
-    st.markdown("### Analysis options")
-    norm_mode = st.selectbox(
-        "Normalize series (helps compare different units)",
-        options=["None", "Rebase to 100 at start", "Z-score (standardize)"]
-    )
-    preset_windows = [3, 6, 12, 24, 60]
-    windows = st.multiselect("Rolling mean windows (periods)", options=preset_windows, default=[6, 12])
-    custom_windows = st.text_input("Custom windows (comma-separated)", placeholder="e.g., 9, 18")
+    st.markdown("### View options")
+    norm = st.selectbox("Normalize", ["None","Rebase to 100 at start","Z-score (standardize)"])
+    rm_presets = [3,6,12,24,60]
+    rm_sel = st.multiselect("Rolling means (periods)", rm_presets, default=[6,12])
+    rm_custom = st.text_input("Custom windows (comma-separated)")
 
-# Load all datasets for dropdown
-with st.spinner("Loading datasets from ECB..."):
-    all_flows = ecb_fetch_dataflows_xml()
+# 1) Choose dataset
+with st.spinner("Loading datasets..."):
+    FLOWS = fetch_dataflows()
 
-explore_tab, analyze_tab = st.tabs(["Explore", "Deep analysis"]) 
+c1, c2 = st.columns([1,1])
+with c1:
+    st.subheader("Dataset")
+    filter_text = st.text_input("Filter datasets", placeholder="e.g., EXR, HICP, exchange rate")
+    df_show = FLOWS
+    if filter_text.strip():
+        q = filter_text.lower()
+        df_show = df_show[df_show.apply(lambda r: q in str(r["name"]).lower() or q in str(r["flow_id"]).lower(), axis=1)]
+    flow_label = st.selectbox("Select dataset", options=df_show["label"].tolist())
+    FLOW = df_show.loc[df_show["label"]==flow_label, "flow_id"].iloc[0]
+    st.caption(f"Flow selected: **{FLOW}**")
 
-with explore_tab:
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        st.subheader("Choose a dataset (flow)")
-        # Optional filter box to quickly narrow the dropdown
-        flow_filter = st.text_input("Filter datasets (by name or id)", placeholder="e.g., exchange rate, EXR")
-        flows_df = all_flows
-        if flow_filter.strip():
-            q = flow_filter.lower()
-            flows_df = flows_df[flows_df.apply(lambda r: q in str(r["name"]).lower() or q in str(r["flow_id"]).lower(), axis=1)]
-        flow_labels = flows_df["label"].tolist()
-        default_index = 0 if len(flow_labels) else None
-        chosen_label = st.selectbox("Dataset (flow)", options=flow_labels, index=default_index)
-        # Map back to flow_id
-        chosen_flow = flows_df.loc[flows_df["label"] == chosen_label, "flow_id"].iloc[0] if flow_labels else ""
-        st.caption(f"Flow selected: **{chosen_flow}**")
+with c2:
+    st.subheader("Build a series (by dimensions)")
+    with st.spinner("Loading structure & code lists..."):
+        DSD = fetch_dsd(FLOW)
+    dim_ids = DSD.get("dim_ids", [])
+    dim_defs = DSD.get("dimensions", [])
+    if not dim_defs:
+        st.error("Could not load structure for this dataset. Try another, or paste keys manually below.")
+    SELECTED: Dict[str,List[str]] = {}
+    # Render one multiselect per dimension
+    for d in dim_defs:
+        codes = d["codes"]
+        if codes.empty:
+            st.write(f"**{d['name']}** ({d['id']}): *no code list available* — leave empty to wildcard.")
+            SELECTED[d['id']] = []
+            continue
+        options = (codes["code"] + " — " + codes["name"]).tolist()
+        pick = st.multiselect(f"{d['name']} ({d['id']})", options=options, help="Leave empty to wildcard this dimension")
+        SELECTED[d['id']] = [p.split(" — ")[0] for p in pick]
 
-    with col2:
-        st.subheader("Browse & select series")
-        max_rows = st.slider("Max keys to load", min_value=200, max_value=50000, step=200, value=5000)
-        list_keys = st.button("Load series for this dataset", use_container_width=True)
+    # Manual key input (comma separated) still possible
+    manual_keys_txt = st.text_input("Or paste full series keys (comma-separated)")
+    manual_keys = [s.strip() for s in manual_keys_txt.split(',') if s.strip()]
 
-        selected_from_list: List[str] = []
-        selected_names: List[str] = []
-        if chosen_flow and list_keys:
-            try:
-                series_df = ecb_list_series(chosen_flow, max_rows=max_rows)
-                if series_df.empty:
-                    st.warning("No series returned (dataset might be restricted or empty).")
-                else:
-                    # Filter series by text
-                    key_filter = st.text_input("Filter series (by name or key)", placeholder="type to filter...")
-                    show_df = series_df
-                    if key_filter.strip():
-                        q = key_filter.lower()
-                        show_df = series_df[series_df.apply(lambda r: q in str(r["name"]).lower() or q in str(r["series_key"]).lower(), axis=1)]
-                    st.dataframe(show_df, use_container_width=True, hide_index=True)
+# 2) Build keys and fetch
+st.markdown("---")
+series_keys: List[str] = []
+try:
+    if dim_ids:
+        series_keys = build_series_keys_from_selection(FLOW, dim_ids, SELECTED)
+except Exception as e:
+    st.error(str(e))
 
-                    # Build labeled options "name — series_key"
-                    options = (show_df["name"] + " — " + show_df["series_key"]).tolist()
-                    pick = st.multiselect("Select series", options=options)
-                    selected_from_list = [p.split(" — ")[-1] for p in pick]
-                    selected_names = [p.split(" — ")[0] for p in pick]
-            except Exception as e:
-                st.error(f"Failed to list series: {e}")
+# Merge manual keys and dedupe
+if manual_keys:
+    series_keys = list(dict.fromkeys(series_keys + manual_keys))
 
-        # Manual entry still supported
-        manual_text = st.text_input("Add series keys (comma-separated)", placeholder="EXR.D.USD.EUR.SP00.A, EXR.D.GBP.EUR.SP00.A")
-        manual_keys = [s.strip() for s in manual_text.split(",") if s.strip()]
+# Show a preview of key pattern
+if dim_ids:
+    preview = ".".join(["{"+d+"}" if not SELECTED.get(d) else "+".join(SELECTED[d]) for d in dim_ids])
+    st.caption(f"Key template: `{FLOW}/{preview}` (empty braces mean wildcard)")
 
-        series_keys = list(dict.fromkeys(selected_from_list + manual_keys))
-        st.caption("Tip: Use the table & filter above to find named series; you can also paste keys manually.")
+# Fetch button
+fetch_now = st.button("Fetch & plot selected series", type="primary")
 
-    st.markdown("---")
+WIDE = pd.DataFrame()
+if fetch_now and series_keys:
+    with st.spinner("Fetching data..."):
+        WIDE = fetch_many(FLOW, series_keys)
+    if WIDE.empty:
+        st.warning("No data returned for the current selection.")
 
-    # Fetch & plot full history
-    df = pd.DataFrame()
-    if chosen_flow and series_keys:
-        df = ecb_fetch_many(chosen_flow, series_keys)
-        if df.empty:
-            st.warning("No data for the selected keys.")
-        else:
-            # Apply normalization requested in sidebar (for immediate visual comparison)
-            base_df = df.copy()
-            if norm_mode == "Rebase to 100 at start":
-                base_df = base_df.apply(lambda s: (s / s.dropna().iloc[0]) * 100)
-            elif norm_mode == "Z-score (standardize)":
-                base_df = base_df.apply(lambda s: (s - s.mean()) / s.std(ddof=0))
+if not WIDE.empty:
+    # Normalization
+    df_plot = WIDE.copy()
+    if norm == "Rebase to 100 at start":
+        df_plot = df_plot.apply(lambda s: (s / s.dropna().iloc[0]) * 100)
+    elif norm == "Z-score (standardize)":
+        df_plot = df_plot.apply(lambda s: (s - s.mean()) / s.std(ddof=0))
 
-            fig = px.line(base_df, x=base_df.index, y=base_df.columns,
-                          labels={"x": "Date", "value": "Value", "variable": "Series"})
-            fig.update_layout(legend_title_text="Series", hovermode="x unified")
-            st.plotly_chart(fig, use_container_width=True)
+    fig = px.line(df_plot, x=df_plot.index, y=df_plot.columns, labels={"x":"Date","value":"Value","variable":"Series"})
+    fig.update_layout(legend_title_text="Series", hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
 
-            with st.expander("Summary stats (on transformed data if applied)"):
-                st.dataframe(base_df.describe().T, use_container_width=True)
+    # Long/tidy export
+    LONG = WIDE.reset_index().melt(id_vars=["Date"], var_name="Series", value_name="Value")
 
-            csv = df.to_csv(index=True).encode("utf-8")
-            st.download_button("Download raw CSV", data=csv, file_name="ecb_data.csv", mime="text/csv", use_container_width=True)
-    else:
-        st.info("Choose a dataset and at least one series to plot.")
+    colA, colB = st.columns(2)
+    with colA:
+        st.subheader("Preview (wide)")
+        st.dataframe(WIDE.tail(20), use_container_width=True)
+        st.download_button("Download wide CSV", WIDE.to_csv().encode("utf-8"), "ecb_wide.csv", "text/csv", use_container_width=True)
+    with colB:
+        st.subheader("Preview (long/tidy)")
+        st.dataframe(LONG.tail(40), use_container_width=True)
+        st.download_button("Download long CSV", LONG.to_csv(index=False).encode("utf-8"), "ecb_long.csv", "text/csv", use_container_width=True)
 
-with analyze_tab:
-    st.subheader("Deep analysis: rolling means")
-    if 'df' not in locals() or df is None or df.empty:
-        st.info("Load one or more series in the **Explore** tab first.")
-    else:
-        # Build list of windows from sidebar + custom
-        windows_list = windows[:]
-        if custom_windows.strip():
-            try:
-                extra = [int(x.strip()) for x in custom_windows.split(',') if x.strip()]
-                windows_list = sorted(list(dict.fromkeys(windows_list + extra)))
-            except Exception:
-                st.warning("Couldn't parse custom windows; please enter integers separated by commas.")
-
-        base_df = df.copy()
-        if norm_mode == "Rebase to 100 at start":
-            base_df = base_df.apply(lambda s: (s / s.dropna().iloc[0]) * 100)
-        elif norm_mode == "Z-score (standardize)":
-            base_df = base_df.apply(lambda s: (s - s.mean()) / s.std(ddof=0))
-
+    # Rolling means (secondary view)
+    st.markdown("### Rolling means")
+    rms = rm_sel[:]
+    if rm_custom.strip():
+        try:
+            extra = [int(x.strip()) for x in rm_custom.split(',') if x.strip()]
+            rms = sorted(list(dict.fromkeys(rms + extra)))
+        except Exception:
+            st.warning("Could not parse custom windows; enter comma-separated integers.")
+    if rms:
+        # Apply to normalized plot frame
         long_frames = []
-        show_raw = st.checkbox("Show raw series", value=True)
-        if show_raw:
-            raw_long = base_df.reset_index().melt(id_vars=["Date"], var_name="Series", value_name="Value")
-            raw_long["Line"] = "Raw"
-            long_frames.append(raw_long)
-        for w in windows_list:
-            ma = base_df.rolling(window=w, min_periods=w).mean()
+        raw_long = df_plot.reset_index().melt(id_vars=["Date"], var_name="Series", value_name="Value")
+        raw_long["Line"] = "Raw"
+        long_frames.append(raw_long)
+        for w in rms:
+            ma = df_plot.rolling(window=w, min_periods=w).mean()
             ma_long = ma.reset_index().melt(id_vars=["Date"], var_name="Series", value_name="Value")
             ma_long["Line"] = f"MA{w}"
             long_frames.append(ma_long)
-        if not long_frames:
-            st.warning("Choose at least one window or enable raw series.")
-        else:
-            plot_df = pd.concat(long_frames, ignore_index=True)
-            fig2 = px.line(plot_df, x="Date", y="Value", color="Series", line_dash="Line",
-                           labels={"Date": "Date", "Value": "Value", "Series": "Series", "Line": "Type"})
-            fig2.update_layout(legend_title_text="Series / Type", hovermode="x unified")
-            st.plotly_chart(fig2, use_container_width=True)
+        plot_df = pd.concat(long_frames, ignore_index=True)
+        fig2 = px.line(plot_df, x="Date", y="Value", color="Series", line_dash="Line")
+        fig2.update_layout(legend_title_text="Series / Type", hovermode="x unified")
+        st.plotly_chart(fig2, use_container_width=True)
+else:
+    st.info("Select a dataset, pick dimension values (or paste keys), then **Fetch & plot**.")
 
-        with st.expander("Download analysis data"):
-            st.download_button(
-                label="Download analysis CSV",
-                data=plot_df.to_csv(index=False).encode("utf-8"),
-                file_name="ecb_analysis.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-
-# Footer
 st.markdown(
     """
     <div style='text-align:center; opacity:0.7; font-size:0.9em;'>
