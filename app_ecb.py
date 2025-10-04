@@ -35,6 +35,30 @@ ECB_BASE = "https://data-api.ecb.europa.eu/service"
 
 # -------------------- Helpers -------------------- #
 @st.cache_data(show_spinner=False, ttl=3600)
+def ecb_get_dimension_order(flow_id: str) -> List[str]:
+    """Fetch the DSD (structure) for a flow and return the ordered list of dimension IDs.
+    Uses SDMX-ML (XML) which is consistently supported by the ECB Data Portal.
+    """
+    if not flow_id:
+        return []
+    url = f"{ECB_BASE}/datastructure/{flow_id}"
+    headers = {"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}
+    resp = requests.get(url, headers=headers, params={"references": "children"}, timeout=45)
+    resp.raise_for_status()
+    root = ET.fromstring(resp.content)
+    ns = {
+        "str": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure",
+    }
+    dims = []
+    # DimensionList/Dimension elements appear in order
+    for dim in root.findall('.//str:DataStructure/str:DataStructureComponents/str:DimensionList/str:Dimension', ns):
+        dim_id = dim.get('id') or dim.get('{http://www.w3.org/2001/XMLSchema-instance}id')
+        if dim_id:
+            dims.append(dim_id)
+    # Often TIME_PERIOD is a measure, not part of the series key
+    return [d for d in dims if d.upper() != 'TIME_PERIOD']
+
+@st.cache_data(show_spinner=False, ttl=3600)
 def ecb_fetch_dataflows_xml() -> pd.DataFrame:
     """Fetch dataflows using SDMX-ML (XML). Returns DataFrame [flow_id, name]."""
     url = f"{ECB_BASE}/dataflow"
@@ -72,6 +96,7 @@ def ecb_fetch_dataflows_xml() -> pd.DataFrame:
 def ecb_list_series(flow_id: str, max_rows: int = 10000) -> pd.DataFrame:
     """List series for a flow using serieskeysonly CSV.
     Returns DataFrame with columns: series_key, name (human title if present), plus dimension columns.
+    Builds series_key using the **official dimension order** from the flow's DSD when available.
     """
     if not flow_id:
         return pd.DataFrame()
@@ -84,20 +109,25 @@ def ecb_list_series(flow_id: str, max_rows: int = 10000) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
-    # Dimension columns (heuristic)
-    exclude = {
-        "TIME_PERIOD","OBS_VALUE","DECIMALS","TIME_FORMAT","OBS_STATUS","OBS_CONF","OBS_PRE_BREAK","OBS_COM",
-        # Keep TITLE columns for naming
-    }
-    dim_cols = [c for c in df.columns if c.isupper() and (" " not in c) and c not in exclude and not c.startswith("OBS_")]
+    # Dimension order from DSD
+    dsd_dims = ecb_get_dimension_order(flow_id)
 
-    # Create series_key
+    # Candidate columns present in the CSV (uppercase, no spaces)
+    csv_cols = [c for c in df.columns if c.isupper() and (" " not in c)]
+
+    # Create series_key with precedence: SERIES_KEY -> DSD order -> heuristic
     if "SERIES_KEY" in df.columns:
         df["series_key"] = df["SERIES_KEY"].astype(str)
+    elif dsd_dims:
+        dims_present = [d for d in dsd_dims if d in df.columns]
+        if dims_present:
+            df["series_key"] = df[dims_present].astype(str).agg(".".join, axis=1)
+        else:
+            df["series_key"] = df[csv_cols].astype(str).agg(".".join, axis=1)
     else:
-        df["series_key"] = df[dim_cols].astype(str).agg(".".join, axis=1)
+        df["series_key"] = df[csv_cols].astype(str).agg(".".join, axis=1)
 
-    # Build human-readable name: prefer TITLE_COMPL > TITLE; else join key dims
+    # Build human-readable name: prefer TITLE_COMPL > TITLE; else join key dims (without FREQ if present)
     name_col = None
     if "TITLE_COMPL" in df.columns and df["TITLE_COMPL"].notna().any():
         name_col = "TITLE_COMPL"
@@ -107,8 +137,7 @@ def ecb_list_series(flow_id: str, max_rows: int = 10000) -> pd.DataFrame:
     if name_col:
         df["name"] = df[name_col].astype(str)
     else:
-        # Compact composite label from key parts (skip generic freq if present)
-        parts_cols = [c for c in dim_cols if c != "FREQ"]
+        parts_cols = [c for c in (dsd_dims or csv_cols) if c != "FREQ" and c in df.columns]
         df["name"] = df[parts_cols].astype(str).agg(" / ".join, axis=1)
 
     # Deduplicate and limit
@@ -116,8 +145,9 @@ def ecb_list_series(flow_id: str, max_rows: int = 10000) -> pd.DataFrame:
     if max_rows:
         out = out.head(max_rows)
 
-    # Order columns
-    ordered = ["series_key", "name"] + [c for c in dim_cols if c in out.columns]
+    # Order columns: series_key, name, then dimensions per DSD order if available
+    ordered_dims = [c for c in (dsd_dims or csv_cols) if c in out.columns]
+    ordered = ["series_key", "name"] + ordered_dims
     return out[ordered]
 
 @st.cache_data(show_spinner=False)
