@@ -91,85 +91,48 @@ def get_dsd_ref(flow_id: str) -> Tuple[Optional[str], Optional[str], Optional[st
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_dsd(flow_id: str) -> Dict:
-    """Fetch DataStructure and return:
-    {
-      'dimensions': [ {'id': 'FREQ', 'name': 'Frequency', 'codelist': ('ECB','CL_FREQ','1.0'), 'codes': DataFrame[code,name]} , ...],
-      'dim_ids': ['FREQ','...']
-    }
+    """(Kept for future use) Fetch DataStructure meta. Not required in the simplified UI."""
+    return {"dimensions": [], "dim_ids": []}
+
+@st.cache_data(show_spinner=True)
+def list_series_catalog(flow_id: str, max_rows: int = 50000) -> pd.DataFrame:
+    """Return a catalog of available series for a flow using `detail=serieskeysonly` CSV.
+    Output columns: key, name, plus any dimension columns found.
+    Uses SERIES_KEY when provided; falls back to concatenating dimension columns in CSV order.
     """
-    agency, did, ver = get_dsd_ref(flow_id)
-    candidates = []
-    if agency and did and ver: candidates.append(f"{agency}/{did}/{ver}")
-    if agency and did: candidates.append(f"{agency}/{did}")
-    if did: candidates.append(did)
-    # fetch DSD
-    root = None
-    for path in candidates:
-        r = requests.get(f"{BASE}/datastructure/{path}", headers={"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}, params={"references":"children"}, timeout=45)
-        if r.status_code==404: continue
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-        break
-    if root is None:
-        return {"dimensions": [], "dim_ids": []}
-    dims = []
-    for dim in root.findall('.//str:DataStructure/str:DataStructureComponents/str:DimensionList/str:Dimension', NS):
-        dim_id = dim.get('id') or dim.get('{http://www.w3.org/2001/XMLSchema-instance}id')
-        if not dim_id or dim_id.upper()=="TIME_PERIOD":
-            continue
-        # human-readable name
-        dname = None
-        for n in dim.findall('com:Name', NS):
-            if (n.get('{http://www.w3.org/XML/1998/namespace}lang') or '').startswith('en'):
-                dname = n.text; break
-        if dname is None:
-            n = dim.find('com:Name', NS)
-            dname = n.text if n is not None else dim_id
-        # codelist ref
-        cl_ref = dim.find('.//str:LocalRepresentation/str:Enumeration/str:Ref', NS)
-        cl_urn = dim.find('.//str:LocalRepresentation/str:Enumeration/str:URN', NS)
-        cl_tuple: Optional[Tuple[str,str,Optional[str]]] = None
-        if cl_ref is not None and (cl_ref.get('class') or '').lower()=="codelist":
-            cl_tuple = (cl_ref.get('agencyID'), cl_ref.get('id'), cl_ref.get('version'))
-        elif cl_urn is not None and cl_urn.text:
-            try:
-                body = cl_urn.text.split('=')[1]
-                agency, rest = body.split(':',1)
-                if '(' in rest:
-                    cid, ver = rest[:-1].split('(')
-                else:
-                    cid, ver = rest, None
-                cl_tuple = (agency, cid, ver)
-            except Exception:
-                pass
-        # fetch codes (if codelist exists)
-        codes_df = pd.DataFrame(columns=["code","name"])        
-        if cl_tuple:
-            a,cid,v = cl_tuple
-            paths = []
-            if a and cid and v: paths.append(f"{a}/{cid}/{v}")
-            if a and cid: paths.append(f"{a}/{cid}")
-            if cid: paths.append(cid)
-            for p in paths:
-                rc = requests.get(f"{BASE}/codelist/{p}", headers={"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}, timeout=45)
-                if rc.status_code==404: continue
-                rc.raise_for_status()
-                cl_root = ET.fromstring(rc.content)
-                rows=[]
-                for it in cl_root.findall('.//str:Code', NS):
-                    code = it.get('id') or it.get('{http://www.w3.org/2001/XMLSchema-instance}id')
-                    nm_el=None
-                    for nn in it.findall('com:Name', NS):
-                        if (nn.get('{http://www.w3.org/XML/1998/namespace}lang') or '').startswith('en'):
-                            nm_el = nn; break
-                    if nm_el is None:
-                        nm_el = it.find('com:Name', NS)
-                    nm = nm_el.text if nm_el is not None else code
-                    rows.append({"code":code, "name":nm})
-                codes_df = pd.DataFrame(rows)
-                break
-        dims.append({"id": dim_id, "name": dname, "codes": codes_df})
-    return {"dimensions": dims, "dim_ids": [d["id"] for d in dims]}
+    if not flow_id:
+        return pd.DataFrame()
+    url = f"{BASE}/data/{flow_id}"
+    params = {"detail": "serieskeysonly", "format": "csvdata"}
+    r = requests.get(url, params=params, headers={"Accept": "text/csv"}, timeout=120)
+    r.raise_for_status()
+    raw = pd.read_csv(io.StringIO(r.text))
+    if raw.empty:
+        return pd.DataFrame()
+    # Build key
+    if "SERIES_KEY" in raw.columns:
+        raw["key"] = raw["SERIES_KEY"].astype(str)
+    else:
+        # Heuristic: join all-uppercase, no-space columns except known observation/meta fields
+        exclude = {"TIME_PERIOD","OBS_VALUE","DECIMALS","TIME_FORMAT","OBS_STATUS","OBS_CONF","OBS_PRE_BREAK","OBS_COM"}
+        dim_cols = [c for c in raw.columns if c.isupper() and (" " not in c) and c not in exclude and not c.startswith("OBS_")]
+        if not dim_cols:
+            raise RuntimeError("Could not infer series key columns from catalog CSV.")
+        raw["key"] = raw[dim_cols].astype(str).agg(".".join, axis=1)
+    # Human name: prefer TITLE_COMPL > TITLE > key
+    if "TITLE_COMPL" in raw.columns and raw["TITLE_COMPL"].notna().any():
+        raw["name"] = raw["TITLE_COMPL"].astype(str)
+    elif "TITLE" in raw.columns and raw["TITLE"].notna().any():
+        raw["name"] = raw["TITLE"].astype(str)
+    else:
+        raw["name"] = raw["key"].astype(str)
+    # Order and limit
+    base_cols = ["name","key"]
+    other_cols = [c for c in raw.columns if c not in base_cols and c not in {"SERIES_KEY"}]
+    out = raw[base_cols + other_cols].drop_duplicates(subset=["key"]).copy()
+    if max_rows:
+        out = out.head(max_rows)
+    return out
 
 # ------------------------------
 # Helpers: data fetching (CSV)
@@ -256,30 +219,39 @@ with c1:
     st.caption(f"Flow selected: **{FLOW}**")
 
 with c2:
-    st.subheader("Build a series (by dimensions)")
-    with st.spinner("Loading structure & code lists..."):
-        DSD = fetch_dsd(FLOW)
-    dim_ids = DSD.get("dim_ids", [])
-    dim_defs = DSD.get("dimensions", [])
-    if not dim_defs:
-        st.error("Could not load structure for this dataset. Try another, or paste keys manually below.")
-    SELECTED: Dict[str,List[str]] = {}
-    # Render one multiselect per dimension
-    for d in dim_defs:
-        codes = d["codes"]
-        if codes.empty:
-            st.write(f"**{d['name']}** ({d['id']}): *no code list available* — leave empty to wildcard.")
-            SELECTED[d['id']] = []
-            continue
-        options = (codes["code"] + " — " + codes["name"]).tolist()
-        pick = st.multiselect(f"{d['name']} ({d['id']})", options=options, help="Leave empty to wildcard this dimension")
-        SELECTED[d['id']] = [p.split(" — ")[0] for p in pick]
+    st.subheader("Browse & select series (named)")
+    max_rows = st.slider("Max keys to load", 200, 100000, value=10000, step=200)
+    load_btn = st.button("Load series catalog for this dataset", use_container_width=True)
 
-    # Manual key input (comma separated) still possible
-    manual_keys_txt = st.text_input("Or paste full series keys (comma-separated)")
-    manual_keys = [s.strip() for s in manual_keys_txt.split(',') if s.strip()]
+    selected_keys: List[str] = []
+    if load_btn:
+        try:
+            cat = list_series_catalog(FLOW, max_rows=max_rows)
+            if cat.empty:
+                st.warning("No series found for this dataset.")
+            else:
+                # Quick filter
+                q = st.text_input("Filter by text (matches name or key)", placeholder="type to filter...")
+                view = cat
+                if q.strip():
+                    ql = q.lower()
+                    view = cat[cat.apply(lambda r: ql in str(r["name"]).lower() or ql in str(r["key"]).lower(), axis=1)]
+                st.dataframe(view, use_container_width=True, hide_index=True)
+                # Multiselect of labeled options
+                options = (view["name"] + " — " + view["key"]).tolist()
+                picks = st.multiselect("Select series to plot", options=options)
+                selected_keys = [p.split(" — ")[-1] for p in picks]
+        except Exception as e:
+            st.error(f"Failed to list series: {e}")
+
+    # Manual input still allowed
+    manual = st.text_input("Or paste series keys (comma-separated)", placeholder="EXR.D.USD.EUR.SP00.A")
+    manual_keys = [s.strip() for s in manual.split(',') if s.strip()]
 
 # 2) Build keys and fetch
+st.markdown("---")
+series_keys: List[str] = []
+series_keys = list(dict.fromkeys((selected_keys if 'selected_keys' in locals() else []) + manual_keys))
 st.markdown("---")
 series_keys: List[str] = []
 try:
@@ -291,11 +263,6 @@ except Exception as e:
 # Merge manual keys and dedupe
 if manual_keys:
     series_keys = list(dict.fromkeys(series_keys + manual_keys))
-
-# Show a preview of key pattern
-if dim_ids:
-    preview = ".".join(["{"+d+"}" if not SELECTED.get(d) else "+".join(SELECTED[d]) for d in dim_ids])
-    st.caption(f"Key template: `{FLOW}/{preview}` (empty braces mean wildcard)")
 
 # Fetch button
 fetch_now = st.button("Fetch & plot selected series", type="primary")
