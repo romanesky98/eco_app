@@ -35,28 +35,87 @@ ECB_BASE = "https://data-api.ecb.europa.eu/service"
 
 # -------------------- Helpers -------------------- #
 @st.cache_data(show_spinner=False, ttl=3600)
-def ecb_get_dimension_order(flow_id: str) -> List[str]:
-    """Fetch the DSD (structure) for a flow and return the ordered list of dimension IDs.
-    Uses SDMX-ML (XML) which is consistently supported by the ECB Data Portal.
+def ecb_get_dsd_ref(flow_id: str):
+    """Return (agencyID, id, version) for the DataStructure referenced by a given dataflow.
+    Falls back to (None, flow_id, None) if not found.
     """
     if not flow_id:
-        return []
-    url = f"{ECB_BASE}/datastructure/{flow_id}"
+        return (None, flow_id, None)
+    url = f"{ECB_BASE}/dataflow/{flow_id}"
     headers = {"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}
-    resp = requests.get(url, headers=headers, params={"references": "children"}, timeout=45)
+    # Ask for references to include linked structures
+    resp = requests.get(url, headers=headers, params={"references": "all"}, timeout=45)
     resp.raise_for_status()
     root = ET.fromstring(resp.content)
     ns = {
+        "mes": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message",
         "str": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure",
     }
-    dims = []
-    # DimensionList/Dimension elements appear in order
-    for dim in root.findall('.//str:DataStructure/str:DataStructureComponents/str:DimensionList/str:Dimension', ns):
-        dim_id = dim.get('id') or dim.get('{http://www.w3.org/2001/XMLSchema-instance}id')
-        if dim_id:
-            dims.append(dim_id)
-    # Often TIME_PERIOD is a measure, not part of the series key
-    return [d for d in dims if d.upper() != 'TIME_PERIOD']
+    df = root.find('.//str:Dataflow', ns)
+    if df is None:
+        return (None, flow_id, None)
+    # Structure/Ref with class="DataStructure"
+    ref = df.find('.//str:Structure/str:Ref', ns)
+    if ref is not None:
+        if (ref.get('class') or '').lower() == 'datastructure':
+            agency = ref.get('agencyID')
+            did = ref.get('id')
+            ver = ref.get('version')
+            return (agency, did or flow_id, ver)
+    # Some providers use URN instead of Ref
+    urn_el = df.find('.//str:Structure/str:URN', ns)
+    if urn_el is not None and urn_el.text:
+        # URN like: urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=ECB:EXR(1.0)
+        text = urn_el.text
+        try:
+            body = text.split('=')[1]
+            agency_id, rest = body.split(':', 1)
+            if '(' in rest:
+                dsd_id, ver = rest.strip(')').split('(')
+            else:
+                dsd_id, ver = rest, None
+            return (agency_id, dsd_id, ver)
+        except Exception:
+            pass
+    return (None, flow_id, None)
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def ecb_get_dimension_order(flow_id: str) -> List[str]:
+    """Fetch the DSD (structure) for a flow and return the ordered list of dimension IDs.
+    Tries agency/id/version combinations per the Dataflow's Structure reference.
+    """
+    if not flow_id:
+        return []
+    agency, dsd_id, version = ecb_get_dsd_ref(flow_id)
+    candidates = []
+    if agency and dsd_id and version:
+        candidates.append(f"{agency}/{dsd_id}/{version}")
+    if agency and dsd_id:
+        candidates.append(f"{agency}/{dsd_id}")
+    if dsd_id:
+        candidates.append(f"{dsd_id}")
+
+    headers = {"Accept": "application/vnd.sdmx.structure+xml;version=2.1"}
+    ns = {"str": "http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure"}
+    for path in candidates:
+        try:
+            url = f"{ECB_BASE}/datastructure/{path}"
+            resp = requests.get(url, headers=headers, params={"references": "children"}, timeout=45)
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+            dims = []
+            for dim in root.findall('.//str:DataStructure/str:DataStructureComponents/str:DimensionList/str:Dimension', ns):
+                dim_id = dim.get('id') or dim.get('{http://www.w3.org/2001/XMLSchema-instance}id')
+                if dim_id:
+                    dims.append(dim_id)
+            if dims:
+                return [d for d in dims if d.upper() != 'TIME_PERIOD']
+        except Exception:
+            continue
+    # Fallback: empty list (caller will use heuristic)
+    return []
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def ecb_fetch_dataflows_xml() -> pd.DataFrame:
